@@ -1,0 +1,11 @@
+{
+  "name": "lancerlogin-module-chores",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Chores for LancerLogin Modular: rotating shop chores, recorded in Notion and announced in Discord.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=24.10"
+  }
+}
