@@ -3,7 +3,7 @@
   "title": "LancerLogin Chores plugin",
   "core": {
     "repository": "isriah/LancerLogin",
-    "tag": "v2.1.0-beta.11",
-    "commit": "dd89a6be28c033629efb83bb338e0e15eaeba896"
+    "tag": "v2.1.0-beta.12",
+    "commit": "2f1ef4c945a9d04d981d70c748ea2cfa01497d67"
   }
 }
