@@ -1,0 +1,31 @@
+/* Chores module styles. Core marks the settings page and setup screen with a module root ([data-module="chores"]); each rule
+   is scoped beneath it with :where() so it keeps the specificity of the class it names. Colors, spacing, radii and type come
+   from Core's tokens, so light, dark and adopter colors follow Core. */
+
+:where([data-module="chores"]) a:not(.ui-button,.settings-setup-link) { color: color-mix(in srgb,var(--primary) 30%,var(--ui-text)); font-weight: 750; text-underline-offset: var(--space-1); }
+:where([data-module="chores"]) .ch-stack { display: grid; gap: var(--space-4); min-width: 0; }
+:where([data-module="chores"]) .ch-stack > :where(h2,h3,p,ul,ol,dl) { margin-block: 0; }
+:where([data-module="chores"]) .ch-notice { margin: 0; }
+:where([data-module="chores"]) .ch-notice:focus { outline: 3px solid var(--ui-focus); outline-offset: 2px; }
+:where([data-module="chores"]) .ch-notice-action { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-3); }
+:where([data-module="chores"]) .ch-card-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-2) var(--space-3); min-height: var(--control-min-block-size); }
+:where([data-module="chores"]) .ch-card-heading > * { margin: 0; }
+:where([data-module="chores"]) p.kicker { color: color-mix(in srgb,var(--primary) 30%,var(--ui-text)); }
+:where([data-module="chores"]) .ch-pill-neutral { border: 1px solid var(--ui-border); color: var(--ui-text-muted); background: var(--ui-surface-subtle); }
+
+:where([data-module="chores"]) .ch-binding { display: grid; gap: var(--space-2); padding-block-end: var(--space-3); border-bottom: 1px solid var(--ui-border); }
+:where([data-module="chores"]) .ch-layout { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: var(--space-1) var(--space-5); margin: 0; padding: 0; list-style: none; font-size: var(--text-small); color: var(--ui-text-muted); }
+:where([data-module="chores"]) .ch-layout strong { color: var(--ui-text); }
+:where([data-module="chores"]) .ch-notes { display: grid; gap: var(--space-2); margin: 0; padding-inline-start: var(--space-5); }
+
+:where([data-module="chores"]) .ch-field { display: grid; gap: var(--space-2); min-width: 0; }
+:where([data-module="chores"]) .ch-choice { display: flex; align-items: center; gap: var(--space-3); min-height: var(--control-min-block-size); font-weight: 500; cursor: pointer; }
+
+:where([data-module="chores"]) .ch-summary { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: var(--space-3); margin: 0; }
+:where([data-module="chores"]) .ch-summary > div { display: grid; align-content: start; gap: var(--space-1); min-width: 0; padding: var(--space-3) var(--space-4); border: 1px solid var(--ui-border); border-radius: var(--radius-card); background: var(--ui-surface-subtle); }
+:where([data-module="chores"]) .ch-summary dt { font-size: var(--text-small); font-weight: 750; }
+:where([data-module="chores"]) .ch-summary dd { margin: 0; font-size: var(--text-section-heading); font-weight: 800; line-height: 1.2; }
+
+@media (max-width: 40rem) {
+  :where([data-module="chores"]) .ch-layout,:where([data-module="chores"]) .ch-summary { grid-template-columns: minmax(0,1fr); }
+}
