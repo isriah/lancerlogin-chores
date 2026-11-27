@@ -17,7 +17,8 @@ import { event, installationId, type Database, type Statement } from "./http.ts"
 import { AppError, ChoresNotion, pageProperty, peopleIds, plainText, canonicalId, type Schema } from "./notion.ts";
 import { nextLocalHour, timeZone } from "./time.ts";
 
-export const peoplePageSize = 100;
+/** People rows per query: small enough that upserting a page stays within a slice's CPU share on Workers Free. */
+export const peoplePageSize = 25;
 export const taskPageSize = 100;
 /** 2,000 task rows at most per run. People who work on tasks tend to appear on recent ones. */
 export const maximumTaskPages = 20;
@@ -27,7 +28,8 @@ export const retryMs = 60 * 60_000;
 export const rateLimitFallbackMs = 60_000;
 /** While an Admin's Stop or a restore pauses outbound delivery, look again after this long. */
 export const deliveryPausedRetryMs = 5 * 60_000;
-const leaseMs = 60_000;
+/** Outlasts the longest run: `cronSlices` steps of `maximumRequestsPerStep` requests, each up to Core's 20 s Notion timeout. */
+export const leaseMs = 180_000;
 /** Steps per run under Core's cron fallback, which has no one-step-per-slice mode. Notion's per-invocation cap also applies. */
 export const cronSlices = 3;
 /** The most Notion requests one step makes: an update of a page Core has not seen in this invocation, with its page check. */
@@ -85,8 +87,19 @@ export type PeopleAction =
   | { readonly kind: "update"; readonly pageId: string; readonly name?: string; readonly active?: true }
   | { readonly kind: "untick"; readonly pageId: string };
 
-/** Every write that would make People follow the active roster, in a stable order. Rows with no member ID are left alone. */
-export function planPeopleWrites(rows: readonly Pick<StoredRow, "pageId" | "externalId" | "name" | "active">[], roster: readonly Member[]): PeopleAction[] {
+/** The longest member ID Chores stores (chores_people.external_id). A longer one is skipped, never written to Notion. */
+export const maximumMemberIdLength = 200;
+/** Core's roster projection lists at most this many active members. A full page may be cut short. */
+export const rosterLimit = 500;
+
+/** Active members whose member ID is too long to keep. They get no People row; the summary counts them. */
+export const overlongMembers = (roster: readonly Member[]) => roster.filter((member) => member.externalId.trim().length > maximumMemberIdLength);
+
+/**
+ * Every write that would make People follow the active roster, in a stable order. Rows with no member ID are left alone,
+ * members with an over-long ID are skipped, and with `untick: false` (a roster that may be cut short) no row is unticked.
+ */
+export function planPeopleWrites(rows: readonly Pick<StoredRow, "pageId" | "externalId" | "name" | "active">[], roster: readonly Member[], options: { readonly untick?: boolean } = {}): PeopleAction[] {
   const rowsById = byExternalId(rows);
   const actions: PeopleAction[] = [];
   const seen = new Set<string>();
@@ -94,6 +107,7 @@ export function planPeopleWrites(rows: readonly Pick<StoredRow, "pageId" | "exte
     const key = member.externalId.trim();
     if (!key || seen.has(key)) continue;
     seen.add(key);
+    if (key.length > maximumMemberIdLength) { seen.add(key.slice(0, maximumMemberIdLength)); continue; }
     const found = rowsById.get(key) ?? [];
     const name = fullName(member);
     if (!found.length) { actions.push({ kind: "create", memberId: member.id, externalId: key, name }); continue; }
@@ -103,7 +117,7 @@ export function planPeopleWrites(rows: readonly Pick<StoredRow, "pageId" | "exte
     const rename = row.name !== name;
     if (rename || row.active !== 1) actions.push({ kind: "update", pageId: row.pageId, ...(rename ? { name } : {}), ...(row.active !== 1 ? { active: true as const } : {}) });
   }
-  for (const row of rows) {
+  if (options.untick !== false) for (const row of rows) {
     const key = row.externalId.trim();
     if (key && row.active === 1 && !seen.has(key)) actions.push({ kind: "untick", pageId: row.pageId });
   }
@@ -147,18 +161,32 @@ export function planSuggestions(rows: readonly Pick<StoredRow, "pageId" | "exter
 }
 
 type Counts = { created: number; updated: number; unticked: number; suggested: number };
-export type Summary = Counts & { readonly dryRun: boolean; planned: Counts | null; writes: number };
-type Sync = { readonly phase: string; readonly cursor: string | null; readonly pages: number; readonly generation: number; readonly dataJson: string | null; readonly summaryJson: string | null; readonly nextDue: number; readonly leaseUntil: number };
+/**
+ * A run's counts. `skipped` counts members with an over-long member ID, who get no row; `codes` says why something was left
+ * undone (`member_id_too_long`, `roster_truncated`). Codes and counts only, never names.
+ */
+export type Summary = Counts & { readonly dryRun: boolean; planned: Counts | null; writes: number; skipped?: number; codes?: string[] };
+type Sync = {
+  readonly phase: string; readonly cursor: string | null; readonly pages: number; readonly generation: number; readonly dataJson: string | null;
+  readonly summaryJson: string | null; readonly nextDue: number; readonly leaseUntil: number; readonly pendingWrite: string | null;
+};
 type JobContext = { readonly db: unknown; readonly services: NotionServices; readonly scheduler?: { readonly steps: boolean; readonly cursor?: string } };
 
-const readSync = (db: Database) => db.prepare(`SELECT phase,cursor,pages,generation,data_json AS dataJson,summary_json AS summaryJson,next_due_ms AS nextDue,lease_until_ms AS leaseUntil
-  FROM chores_sync WHERE installation_id=? AND stream='people'`).bind(installationId).first<Sync>();
+const readSync = (db: Database) => db.prepare(`SELECT phase,cursor,pages,generation,data_json AS dataJson,summary_json AS summaryJson,next_due_ms AS nextDue,lease_until_ms AS leaseUntil,
+  pending_write AS pendingWrite FROM chores_sync WHERE installation_id=? AND stream='people'`).bind(installationId).first<Sync>();
 const readSettings = (db: Database) => db.prepare("SELECT enabled,dry_run AS dryRun,people_sync_hour AS hour FROM chores_settings WHERE installation_id=?").bind(installationId).first<{ enabled: number; dryRun: number; hour: number }>();
-const readRows = (db: Database) => db.prepare(`SELECT page_id AS pageId,external_id AS externalId,member_id AS memberId,name,active,account_count AS accountCount,notion_user_id AS notionUserId,
-  suggested_user_id AS suggestedUserId,match_state AS matchState FROM chores_people WHERE installation_id=? ORDER BY page_id`).bind(installationId).all<StoredRow>().then((result) => result.results ?? []);
+/** The People mirror. With a generation, only rows read or written in that run: anything left by an earlier run is ignored. */
+const readRows = (db: Database, generation?: number) => db.prepare(`SELECT page_id AS pageId,external_id AS externalId,member_id AS memberId,name,active,account_count AS accountCount,notion_user_id AS notionUserId,
+  suggested_user_id AS suggestedUserId,match_state AS matchState FROM chores_people WHERE installation_id=?${generation === undefined ? "" : " AND scan_generation=?"} ORDER BY page_id`)
+  .bind(installationId, ...generation === undefined ? [] : [generation]).all<StoredRow>().then((result) => result.results ?? []);
 export const readRoster = (db: Database) => listActiveRosterIdentities(db as unknown as D1Database, installationId).then((result) => (result.results ?? []) as Member[]);
 
-const setSync = (db: Database, fields: Partial<{ phase: string; cursor: string | null; pages: number; generation: number; dataJson: string | null; summary: Summary; nextDue: number; startedMs: number; finishedMs: number; lastError: string | null }>): Statement => {
+type SyncFields = Partial<{ phase: string; cursor: string | null; pages: number; generation: number; dataJson: string | null; summary: Summary; nextDue: number; startedMs: number; finishedMs: number; lastError: string | null; pendingWrite: string | null }>;
+/**
+ * Change the People stream's row. With `token`, only while that runner still holds the lease: a re-verify that resets the
+ * stream clears the lease, so a slice still running for the old databases changes nothing.
+ */
+const setSync = (db: Database, fields: SyncFields, token?: string): Statement => {
   const columns: [string, unknown][] = [];
   if (fields.phase !== undefined) columns.push(["phase", fields.phase]);
   if (fields.cursor !== undefined) columns.push(["cursor", fields.cursor]);
@@ -170,13 +198,15 @@ const setSync = (db: Database, fields: Partial<{ phase: string; cursor: string |
   if (fields.startedMs !== undefined) columns.push(["started_ms", fields.startedMs]);
   if (fields.finishedMs !== undefined) columns.push(["finished_ms", fields.finishedMs]);
   if (fields.lastError !== undefined) columns.push(["last_error", fields.lastError]);
-  return db.prepare(`UPDATE chores_sync SET ${columns.map(([name]) => `${name}=?`).join(",")} WHERE installation_id=? AND stream='people'`).bind(...columns.map(([, value]) => value), installationId);
+  if (fields.pendingWrite !== undefined) columns.push(["pending_write", fields.pendingWrite]);
+  return db.prepare(`UPDATE chores_sync SET ${columns.map(([name]) => `${name}=?`).join(",")} WHERE installation_id=? AND stream='people'${token === undefined ? "" : " AND lease_token=?"}`)
+    .bind(...columns.map(([, value]) => value), installationId, ...token === undefined ? [] : [token]);
 };
 
 const upsertRow = (db: Database, row: PeopleRow, generation: number, now: number) => db.prepare(`INSERT INTO chores_people(installation_id,page_id,external_id,name,active,account_count,notion_user_id,suggested_user_id,match_state,scan_generation,seen_ms)
   VALUES (?,?,?,?,?,?,?,?,'unmatched',?,?) ON CONFLICT(installation_id,page_id) DO UPDATE SET external_id=excluded.external_id,name=excluded.name,active=excluded.active,
   account_count=excluded.account_count,notion_user_id=excluded.notion_user_id,suggested_user_id=excluded.suggested_user_id,scan_generation=excluded.scan_generation,seen_ms=excluded.seen_ms`)
-  .bind(installationId, row.pageId, row.externalId.slice(0, 200), row.name.slice(0, 400), row.active ? 1 : 0, row.accounts.length, row.accounts.length === 1 ? row.accounts[0] : null,
+  .bind(installationId, row.pageId, row.externalId.slice(0, maximumMemberIdLength), row.name.slice(0, 400), row.active ? 1 : 0, row.accounts.length, row.accounts.length === 1 ? row.accounts[0] : null,
     row.suggested.length === 1 ? row.suggested[0] : row.suggested.length > 1 ? "*" : null, generation, now);
 
 const emptyCounts = (): Counts => ({ created: 0, updated: 0, unticked: 0, suggested: 0 });
@@ -184,59 +214,76 @@ const parseSummary = (sync: Sync, dryRun: boolean): Summary => {
   try { const summary = JSON.parse(sync.summaryJson ?? "") as Summary; if (summary && typeof summary.writes === "number") return summary; } catch { /* a fresh summary */ }
   return { ...emptyCounts(), dryRun, planned: null, writes: 0 };
 };
+const countKinds = (actions: readonly PeopleAction[]): Counts => ({ created: actions.filter((action) => action.kind === "create").length, updated: actions.filter((action) => action.kind === "update").length, unticked: actions.filter((action) => action.kind === "untick").length, suggested: 0 });
 
-type SliceContext = { readonly db: Database; readonly schema: Schema; readonly client: ChoresNotion; readonly now: number; readonly dryRun: boolean; readonly hour: number; readonly connection: ConnectionRow | null };
+type SliceContext = { readonly db: Database; readonly schema: Schema; readonly client: ChoresNotion; readonly now: number; readonly dryRun: boolean; readonly hour: number; readonly connection: ConnectionRow | null; readonly token: string };
 
 /** Finish the run: back to idle until the next daily hour, with the counts kept for the dashboard. */
-async function finish(context: SliceContext, sync: Sync, summary: Summary): Promise<false> {
+async function finish(context: SliceContext, summary: Summary): Promise<false> {
   const { db, now } = context;
   const next = nextLocalHour(now, await timeZone(db), context.hour);
   await db.batch([
-    setSync(db, { phase: "idle", cursor: null, pages: 0, dataJson: null, summary, nextDue: next, finishedMs: now, lastError: null }),
-    event(db, "people_sync", now, { detail: { dryRun: summary.dryRun, created: summary.created, updated: summary.updated, unticked: summary.unticked, suggested: summary.suggested, planned: summary.planned } }),
+    setSync(db, { phase: "idle", cursor: null, pages: 0, dataJson: null, pendingWrite: null, summary, nextDue: next, finishedMs: now, lastError: null }, context.token),
+    event(db, "people_sync", now, { detail: { dryRun: summary.dryRun, created: summary.created, updated: summary.updated, unticked: summary.unticked, suggested: summary.suggested, planned: summary.planned, skipped: summary.skipped ?? 0, codes: summary.codes ?? [] } }),
   ]);
-  void sync;
   return false;
 }
 
-const afterWrites = (context: SliceContext, sync: Sync, summary: Summary) =>
-  context.schema.task ? context.db.batch([setSync(context.db, { phase: "scan", cursor: null, pages: 0, dataJson: "{}", summary })]).then(() => true) : finish(context, sync, summary);
+const afterWrites = (context: SliceContext, summary: Summary) =>
+  context.schema.task ? context.db.batch([setSync(context.db, { phase: "scan", cursor: null, pages: 0, dataJson: "{}", summary }, context.token)]).then(() => true) : finish(context, summary);
 
-/** One step of the run, with at most one Notion request. Returns whether the run has more to do. */
+/**
+ * Record that a Notion write is about to be sent. False when this runner no longer holds the lease, and then nothing is sent.
+ * The marker is cleared in the same batch that records the write locally.
+ */
+const markWrite = async (context: SliceContext, kind: string) =>
+  (await setSync(context.db, { pendingWrite: JSON.stringify({ kind, at: context.now }) }, context.token).run()).meta?.changes === 1;
+
+/** One step of the run, with at most two Notion requests. Returns whether the run has more to do. */
 async function slice(context: SliceContext, sync: Sync): Promise<boolean> {
-  const { db, schema, client, now, dryRun } = context;
+  const { db, schema, client, now, dryRun, token } = context;
+  const set = (fields: SyncFields) => setSync(db, fields, token);
   let summary = parseSummary(sync, dryRun);
   if (sync.phase === "idle") {
     summary = { ...emptyCounts(), dryRun, planned: null, writes: 0 };
     sync = { ...sync, phase: "read", cursor: null, pages: 0, generation: sync.generation + 1 };
-    await setSync(db, { phase: "read", cursor: null, pages: 0, generation: sync.generation, dataJson: null, summary, startedMs: now, nextDue: 0 }).run();
+    await set({ phase: "read", cursor: null, pages: 0, generation: sync.generation, dataJson: null, pendingWrite: null, summary, startedMs: now, nextDue: 0 }).run();
+  }
+
+  // A write was sent but never recorded (the local batch failed, or the run stopped). It may have happened, so read People
+  // again, which adopts a row Notion created, rather than planning, and perhaps sending, the same write twice.
+  if (sync.pendingWrite && (sync.phase === "write" || sync.phase === "suggest")) {
+    await set({ phase: "read", cursor: null, pages: 0, dataJson: null, pendingWrite: null }).run();
+    return true;
   }
 
   if (sync.phase === "read") {
     const page = await client.query("people", peoplePageSize, sync.cursor ?? undefined);
     const rows = page.results.map((result) => readPeopleRow(schema, result)).filter((row) => row.pageId);
     const upserts = rows.map((row) => upsertRow(db, row, sync.generation, now));
-    if (page.next) { await db.batch([...upserts, setSync(db, { cursor: page.next, pages: sync.pages + 1 })]); return true; }
+    if (page.next) { await db.batch([...upserts, set({ cursor: page.next, pages: sync.pages + 1 })]); return true; }
     await db.batch([...upserts, db.prepare("DELETE FROM chores_people WHERE installation_id=? AND scan_generation<?").bind(installationId, sync.generation)]);
     // Every row is read: decide which member each belongs to and whether it is a match.
-    const [stored, roster] = await Promise.all([readRows(db), readRoster(db)]);
+    const [stored, roster] = await Promise.all([readRows(db, sync.generation), readRoster(db)]);
     const matches = matchRows(stored, roster);
-    if (dryRun) {
-      const actions = planPeopleWrites(stored, roster);
-      summary = { ...summary, planned: { created: actions.filter((action) => action.kind === "create").length, updated: actions.filter((action) => action.kind === "update").length, unticked: actions.filter((action) => action.kind === "untick").length, suggested: 0 } };
-    }
+    const skipped = overlongMembers(roster).length;
+    const truncated = roster.length >= rosterLimit;
+    const codes = [...skipped ? ["member_id_too_long"] : [], ...truncated ? ["roster_truncated"] : []];
+    summary = { ...summary, skipped, codes, ...(dryRun ? { planned: countKinds(planPeopleWrites(stored, roster, { untick: !truncated })) } : {}) };
     await db.batch([
-      ...matches.map((match) => db.prepare("UPDATE chores_people SET member_id=?,match_state=? WHERE installation_id=? AND page_id=?").bind(match.memberId, match.matchState, installationId, match.pageId)),
-      setSync(db, { phase: "write", cursor: null, pages: 0, summary }),
+      ...matches.map((match) => db.prepare("UPDATE chores_people SET member_id=?,match_state=? WHERE installation_id=? AND page_id=? AND scan_generation=?").bind(match.memberId, match.matchState, installationId, match.pageId, sync.generation)),
+      set({ phase: "write", cursor: null, pages: 0, summary }),
     ]);
     return true;
   }
 
   if (sync.phase === "write") {
-    if (dryRun) return afterWrites(context, sync, summary);
-    const [stored, roster] = await Promise.all([readRows(db), readRoster(db)]);
-    const action = summary.writes < maximumWritesPerRun ? planPeopleWrites(stored, roster)[0] : undefined;
-    if (!action) return afterWrites(context, sync, summary);
+    if (dryRun) return afterWrites(context, summary);
+    const [stored, roster] = await Promise.all([readRows(db, sync.generation), readRoster(db)]);
+    // A full page from the roster projection may be cut short: unticking then could mark real members inactive.
+    const action = summary.writes < maximumWritesPerRun ? planPeopleWrites(stored, roster, { untick: roster.length < rosterLimit })[0] : undefined;
+    if (!action) return afterWrites(context, summary);
+    if (!await markWrite(context, action.kind)) return false;
     summary = { ...summary, writes: summary.writes + 1 };
     if (action.kind === "create") {
       const created = await client.createPeopleRow(schema, { name: action.name, memberId: action.externalId });
@@ -244,7 +291,7 @@ async function slice(context: SliceContext, sync: Sync): Promise<boolean> {
       await db.batch([
         db.prepare(`INSERT INTO chores_people(installation_id,page_id,external_id,member_id,name,active,account_count,match_state,scan_generation,seen_ms) VALUES (?,?,?,?,?,1,0,'unmatched',?,?)
           ON CONFLICT(installation_id,page_id) DO NOTHING`).bind(installationId, created.id, action.externalId, action.memberId, action.name.slice(0, 400), sync.generation, now),
-        setSync(db, { summary }),
+        set({ summary, pendingWrite: null }),
       ]);
     } else if (action.kind === "update") {
       await client.updatePeopleRow(schema, action.pageId, { ...(action.name !== undefined ? { name: action.name } : {}), ...(action.active ? { active: true } : {}) });
@@ -253,14 +300,14 @@ async function slice(context: SliceContext, sync: Sync): Promise<boolean> {
         db.prepare(`UPDATE chores_people SET name=COALESCE(?,name),active=CASE WHEN ? THEN 1 ELSE active END,
           match_state=CASE WHEN match_state<>'ambiguous' AND account_count=1 AND member_id IS NOT NULL AND (? OR active=1) THEN 'matched' ELSE match_state END WHERE installation_id=? AND page_id=?`)
           .bind(action.name?.slice(0, 400) ?? null, action.active ? 1 : 0, action.active ? 1 : 0, installationId, action.pageId),
-        setSync(db, { summary }),
+        set({ summary, pendingWrite: null }),
       ]);
     } else {
       await client.updatePeopleRow(schema, action.pageId, { active: false });
       summary.unticked++;
       await db.batch([
         db.prepare("UPDATE chores_people SET active=0,match_state=CASE WHEN match_state='matched' THEN 'unmatched' ELSE match_state END WHERE installation_id=? AND page_id=?").bind(installationId, action.pageId),
-        setSync(db, { summary }),
+        set({ summary, pendingWrite: null }),
       ]);
     }
     return true;
@@ -268,28 +315,29 @@ async function slice(context: SliceContext, sync: Sync): Promise<boolean> {
 
   if (sync.phase === "scan") {
     const task = schema.task;
-    if (!task) return finish(context, sync, summary);
+    if (!task) return finish(context, summary);
     const page = await client.query("task", taskPageSize, sync.cursor ?? undefined);
     let found: Record<string, string> = {};
     try { found = JSON.parse(sync.dataJson ?? "{}") as Record<string, string>; } catch { /* start again from nothing */ }
     found = mergeTaskPeople(found, page.results, task.peoplePropertyIds);
     const pages = sync.pages + 1;
-    await setSync(db, page.next && pages < maximumTaskPages ? { cursor: page.next, pages, dataJson: JSON.stringify(found) } : { phase: "suggest", cursor: null, pages: 0, dataJson: JSON.stringify(found) }).run();
+    await set(page.next && pages < maximumTaskPages ? { cursor: page.next, pages, dataJson: JSON.stringify(found) } : { phase: "suggest", cursor: null, pages: 0, dataJson: JSON.stringify(found) }).run();
     return true;
   }
 
   // suggest
   let found: Record<string, string> = {};
   try { found = JSON.parse(sync.dataJson ?? "{}") as Record<string, string>; } catch { /* nothing to suggest */ }
-  const suggestions = planSuggestions(await readRows(db), found);
-  if (dryRun) return finish(context, sync, { ...summary, planned: { ...(summary.planned ?? emptyCounts()), suggested: suggestions.length } });
+  const suggestions = planSuggestions(await readRows(db, sync.generation), found);
+  if (dryRun) return finish(context, { ...summary, planned: { ...(summary.planned ?? emptyCounts()), suggested: suggestions.length } });
   const next = summary.writes < maximumWritesPerRun ? suggestions[0] : undefined;
-  if (!next) return finish(context, sync, summary);
+  if (!next) return finish(context, summary);
+  if (!await markWrite(context, "suggest")) return false;
   await client.updatePeopleRow(schema, next.pageId, { suggested: [next.notionUserId] });
   summary = { ...summary, writes: summary.writes + 1, suggested: summary.suggested + 1 };
   await db.batch([
     db.prepare("UPDATE chores_people SET suggested_user_id=? WHERE installation_id=? AND page_id=?").bind(next.notionUserId, installationId, next.pageId),
-    setSync(db, { summary }),
+    set({ summary, pendingWrite: null }),
   ]);
   return true;
 }
@@ -308,6 +356,17 @@ export async function reschedulePeopleSync(db: Database, hour: number, now: numb
   const next = nextLocalHour(now, await timeZone(db), hour);
   await db.prepare("UPDATE chores_sync SET next_due_ms=? WHERE installation_id=? AND stream='people' AND phase='idle' AND next_due_ms>0").bind(next, installationId).run();
 }
+
+/**
+ * Start the People stream again from the top for a different People database: empty the mirror, move to a new generation
+ * and take the lease from any runner still working on the old database, whose later writes to the stream then change
+ * nothing. The row is kept, so the generation only ever grows and an old run's rows can never pass for the new run's.
+ */
+export const resetPeopleSyncStatements = (db: Database): Statement[] => [
+  db.prepare("DELETE FROM chores_people WHERE installation_id=?").bind(installationId),
+  db.prepare(`UPDATE chores_sync SET phase='idle',cursor=NULL,pages=0,data_json=NULL,pending_write=NULL,generation=generation+1,next_due_ms=0,lease_until_ms=0,lease_token=NULL
+    WHERE installation_id=? AND stream='people'`).bind(installationId),
+];
 
 const readsNotion = (phase: string) => phase === "idle" || phase === "read" || phase === "scan";
 
@@ -330,13 +389,15 @@ export async function runChores(context: JobContext): Promise<unknown> {
   if (problem || !schema) return { skipped: problem ?? "not_verified" };
   // The row must exist before any failure, or the next poke would call Notion again straight away.
   if (!existing) await ensureSync(db).run();
-  const claimed = await db.prepare("UPDATE chores_sync SET lease_until_ms=? WHERE installation_id=? AND stream='people' AND lease_until_ms<=? AND next_due_ms<=?").bind(now + leaseMs, installationId, now, now).run();
+  const token = crypto.randomUUID();
+  const claimed = await db.prepare("UPDATE chores_sync SET lease_until_ms=?,lease_token=? WHERE installation_id=? AND stream='people' AND lease_until_ms<=? AND next_due_ms<=?").bind(now + leaseMs, token, installationId, now, now).run();
   if (claimed.meta?.changes !== 1) return { skipped: "busy" };
-  const releaseStatement = () => db.prepare("UPDATE chores_sync SET lease_until_ms=0 WHERE installation_id=? AND stream='people'").bind(installationId);
+  /** Release only this runner's own lease. */
+  const releaseStatement = () => db.prepare("UPDATE chores_sync SET lease_until_ms=0,lease_token=NULL WHERE installation_id=? AND stream='people' AND lease_token=?").bind(installationId, token);
 
   let sync = await readSync(db);
   const client = new ChoresNotion(context.services.notion);
-  const sliceContext: SliceContext = { db, schema, client, now, dryRun: settings.dryRun === 1, hour: settings.hour, connection };
+  const sliceContext: SliceContext = { db, schema, client, now, dryRun: settings.dryRun === 1, hour: settings.hour, connection, token };
   const steps = context.scheduler?.steps === true;
   let phase = sync!.phase;
   try {
@@ -349,24 +410,34 @@ export async function runChores(context: JobContext): Promise<unknown> {
       if (!sync) { await releaseStatement().run(); return { done: true, notionRequests: client.spent }; }
     }
   } catch (error) {
-    if (!(error instanceof AppError)) { await releaseStatement().run(); throw error; }
-    const keepPlace = (wait: number, extra: Record<string, unknown> = {}) => db.batch([setSync(db, { nextDue: now + wait, lastError: error.code }), releaseStatement()]).then(() => ({ failed: error.code, ...extra }));
-    // Keep the place and wait as long as Notion asked, or until delivery resumes. Nothing was written by the failed step.
+    if (!(error instanceof AppError)) {
+      // Not Notion's answer: a D1 failure or the scheduler's budget. A write may have been sent without being recorded, so
+      // the stream reads People again rather than plan it twice. If even this fails, the pending-write marker does the same.
+      const reread = phase === "write" || phase === "suggest" ? [setSync(db, { phase: "read", cursor: null, pages: 0, dataJson: null, pendingWrite: null }, token)] : [];
+      await db.batch([...reread, releaseStatement()]).catch(() => undefined);
+      throw error;
+    }
+    // A failure Notion confirmed (not uncertain) means nothing was written, so the marker can go.
+    const marker = error.uncertain ? {} : { pendingWrite: null };
+    const keepPlace = (wait: number, extra: Record<string, unknown> = {}) => db.batch([setSync(db, { nextDue: now + wait, lastError: error.code, ...marker }, token), releaseStatement()]).then(() => ({ failed: error.code, ...extra }));
+    // Keep the place and wait as long as Notion asked, or until delivery resumes.
     if (error.code === "notion_429") {
       const asked = Number((error.details as { retryAfterMs?: number } | undefined)?.retryAfterMs);
       const wait = Number.isFinite(asked) && asked > 0 ? asked : rateLimitFallbackMs;
       return keepPlace(wait, { retryAfterMs: wait });
     }
     if (error.code === "delivery_paused") return keepPlace(deliveryPausedRetryMs);
-    if (error.code === "notion_call_limit") { await releaseStatement().run(); return { more: true, cursor: phase }; }
+    // Core refused before sending anything.
+    if (error.code === "notion_call_limit") { await db.batch([setSync(db, { pendingWrite: null }, token), releaseStatement()]); return { more: true, cursor: phase }; }
     // Only codes reach the record. The next run starts from the top, so an uncertain create is found by reading, not repeated.
-    await db.batch([setSync(db, { phase: "idle", cursor: null, pages: 0, dataJson: null, nextDue: now + retryMs, lastError: error.code }), releaseStatement()]);
+    await db.batch([setSync(db, { phase: "idle", cursor: null, pages: 0, dataJson: null, pendingWrite: null, nextDue: now + retryMs, lastError: error.code }, token), releaseStatement()]);
     if (error.code === "notion_401" || readsNotion(phase) && (error.code === "notion_403" || error.code === "notion_404")) await recordRefusal(db, connection, error.code, now);
     return { failed: error.code, phase };
   }
   await releaseStatement().run();
   return { more: true, cursor: sync?.phase ?? phase };
 }
+
 
 /** People rows with exactly one Notion account, from the first page of rows that have one: the write check's choices. */
 export async function readPeopleAccounts(client: ChoresNotion, schema: Schema) {

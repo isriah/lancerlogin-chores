@@ -9,7 +9,7 @@
 import type { NotionBinding, NotionService, NotionServiceStatus } from "@lancerlogin/module-sdk/api";
 import { audit, installationId, json, object, refuse, type Database, type Statement } from "./http.ts";
 import { AppError, ChoresNotion, bindingIds, canonicalId, requiredBindings, validNotionUrl, type BindingId, type Schema } from "./notion.ts";
-import { readPeopleAccounts } from "./people.ts";
+import { readPeopleAccounts, resetPeopleSyncStatements } from "./people.ts";
 import { personWriteCheck } from "./write-check.ts";
 
 /** What Core gives a route or job. */
@@ -143,10 +143,7 @@ const connectionStatements = (db: Database, schema: Schema, previous: Schema | u
     // The write check proves one Chore log; it no longer counts once the binding points at another.
     db.prepare(`UPDATE chores_notion SET write_check_ms=NULL,write_check_state=NULL,write_check_code=NULL,write_check_cleanup=NULL,write_check_page_url=NULL,write_check_log_source=NULL
       WHERE installation_id=? AND write_check_log_source IS NOT ?`).bind(installationId, canonicalId(schema.log.dataSourceId) ?? schema.log.dataSourceId),
-    ...(peopleChanged ? [
-      db.prepare("DELETE FROM chores_people WHERE installation_id=?").bind(installationId),
-      db.prepare("DELETE FROM chores_sync WHERE installation_id=? AND stream='people'").bind(installationId),
-    ] : []),
+    ...(peopleChanged ? resetPeopleSyncStatements(db) : []),
     audit(db, actor, "chores.connection_verified", now),
   ];
 };

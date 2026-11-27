@@ -59,24 +59,28 @@ export async function personWriteCheck(db: Database, services: NotionServices, n
     return undefined;
   }
 
+  // From here the test row exists. Whatever happens while reading it back, it is moved to the trash and the outcome is
+  // recorded; any failure that did not come from Notion is rethrown only after that.
   let confirmed = false;
   let code: string | null = null;
+  let unexpected: unknown;
+  let cleanup: Outcome["cleanup"] = "trashed";
   try {
     const page = await notion.logPage(created.id);
     const people = peopleIds(pageProperty(page, schema.log.properties.person));
     confirmed = people.length === 1 && people[0] === notionUserId;
     if (!confirmed) code = "person_not_saved";
   } catch (error) {
-    if (!(error instanceof AppError)) throw error;
-    code = error.code;
+    if (!(error instanceof AppError)) unexpected = error;
+    code = error instanceof AppError ? error.code : "read_failed";
+  } finally {
+    // Trash only the page this check created, whatever the read said.
+    try { await notion.trashLogPage(created.id); }
+    catch (error) { if (!(error instanceof AppError) && unexpected === undefined) unexpected = error; cleanup = "failed"; }
   }
-
-  // Trash only the page this check created, whatever the read said.
-  let cleanup: Outcome["cleanup"] = "trashed";
-  try { await notion.trashLogPage(created.id); }
-  catch (error) { if (!(error instanceof AppError)) throw error; cleanup = "failed"; }
 
   if (confirmed) await clearRefusal(db, row);
   await record(db, { state: confirmed ? "passed" : "failed", code, cleanup, pageUrl: cleanup === "failed" ? created.url ?? null : null }, logSource, actor, now);
+  if (unexpected !== undefined) throw unexpected;
   return undefined;
 }

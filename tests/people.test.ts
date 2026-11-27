@@ -252,3 +252,126 @@ test("settings saves carry the revision the page read", () => withHarness(async 
   assert.equal((await h.admin("PUT", "/settings", { revision: 0, dryRun: false })).status, 409);
   assert.equal((await h.admin("PUT", "/settings", { revision: 1, peopleSyncHour: 24 })).status, 400);
 }));
+
+test("a create whose local record fails is not sent again: the next slice reads People and adopts the row", () => withHarness(async (h, notion) => {
+  await h.connect();
+  h.settings({ enabled: true, dryRun: false });
+  // The batch that records the created row fails once, as a D1 error or the scheduler's budget would.
+  let failures = 1;
+  h.state.fail = (sql) => sql.includes("INSERT INTO chores_people(installation_id,page_id,external_id,member_id") && failures-- > 0;
+  await assert.rejects(h.runJob(true), /D1_ERROR/);
+  assert.equal(notion.rows.get(ids.peopleSource)!.length, 1, "one row was created before the failure");
+  h.state.fail = undefined;
+  const slices = await h.runJob(true);
+  assert.equal(slices.at(-1)!.outcome.done, true);
+  const people = notion.rows.get(ids.peopleSource)!;
+  assert.equal(people.length, 2, "one row per member, no duplicate");
+  assert.deepEqual(people.map((row) => row.properties["LancerLogin member ID"].rich_text[0].plain_text).sort(), ["9001", "9002"]);
+  assert.equal(h.test.rows<any>("SELECT count(*) AS n FROM chores_people WHERE match_state='ambiguous'")[0].n, 0);
+}));
+
+test("if even the fallback write fails (the run stopped), the pending-write marker sends the next slice back to reading", () => withHarness(async (h, notion) => {
+  await h.connect();
+  h.settings({ enabled: true, dryRun: false });
+  // Fail the record of the create, then the batch that would send the stream back to reading.
+  let stage = 0;
+  h.state.fail = (sql) => {
+    if (stage === 0 && sql.includes("INSERT INTO chores_people(installation_id,page_id,external_id,member_id")) { stage = 1; return true; }
+    if (stage === 1 && sql.startsWith("UPDATE chores_sync SET phase=?")) { stage = 2; return true; }
+    return false;
+  };
+  await assert.rejects(h.runJob(true), /D1_ERROR/);
+  h.state.fail = undefined;
+  const marker = h.test.rows<any>("SELECT phase,pending_write AS pending FROM chores_sync")[0];
+  assert.equal(marker.phase, "write");
+  assert.ok(marker.pending, "the marker survived");
+  h.test.run("UPDATE chores_sync SET lease_until_ms=0");
+  notion.calls.length = 0;
+  const next = await h.slice();
+  assert.equal(next.outcome.cursor, "read");
+  assert.equal(writes(notion).length, 0, "nothing was sent");
+  await h.runJob(true);
+  assert.equal(notion.rows.get(ids.peopleSource)!.length, 2);
+}));
+
+test("a member ID longer than 200 characters is skipped before any Notion call, with a recorded code", () => withHarness(async (h, notion) => {
+  await h.connect();
+  h.settings({ enabled: true, dryRun: false });
+  const long = "9".repeat(201);
+  h.test.run("INSERT INTO members(id,installation_id,external_id,first_name,last_name) VALUES ('m-long','primary',?,'Test Student','L')", long);
+  const slices = await h.runJob(true);
+  assert.equal(slices.at(-1)!.outcome.done, true);
+  assert.ok(!notion.calls.some((call) => JSON.stringify(call.body ?? {}).includes(long.slice(0, 50))), "the long ID never reached Notion");
+  assert.equal(notion.rows.get(ids.peopleSource)!.length, 2, "the other members still got rows");
+  const summary = JSON.parse(h.test.rows<any>("SELECT summary_json FROM chores_sync")[0].summary_json);
+  assert.equal(summary.skipped, 1);
+  assert.deepEqual(summary.codes, ["member_id_too_long"]);
+  assert.match(h.test.rows<any>("SELECT detail_json FROM chores_events WHERE kind='people_sync'")[0].detail_json, /member_id_too_long/);
+}));
+
+test("a full roster page (500) may be cut short, so nobody is unticked and the run records why", () => withHarness(async (h, notion) => {
+  await h.connect();
+  h.settings({ enabled: true, dryRun: false });
+  for (let index = 3; index <= 500; index++) h.test.run("INSERT INTO members(id,installation_id,external_id,first_name,last_name) VALUES (?,'primary',?,'Test Student',?)", `m-${index}`, String(10_000 + index), `N${index}`);
+  const rows = [
+    peopleRow({ name: "Test Student A", memberId: "9001" }), peopleRow({ name: "Test Student B", memberId: "9002" }),
+    ...Array.from({ length: 498 }, (_, offset) => peopleRow({ name: `Test Student N${offset + 3}`, memberId: String(10_003 + offset) })),
+  ];
+  const departed = peopleRow({ name: "Test Student Z", memberId: "9099", active: true });
+  seed(notion, ids.peopleSource, [...rows, departed]);
+  const slices = await h.runJob(true, 400);
+  assert.equal(slices.at(-1)!.outcome.done, true);
+  slices.forEach((slice, index) => withinBudget(slice.cost, `slice ${index}`));
+  assert.equal(departed.properties.Active.checkbox, true, "not unticked");
+  assert.equal(writes(notion).length, 0);
+  assert.deepEqual(JSON.parse(h.test.rows<any>("SELECT summary_json FROM chores_sync")[0].summary_json).codes, ["roster_truncated"]);
+}));
+
+test("the lease outlasts the worst cron run, and a runner releases only its own lease", () => withHarness(async (h, notion) => {
+  const { leaseMs, cronSlices } = await import("../src/people.ts");
+  assert.ok(leaseMs > cronSlices * maximumRequestsPerStep * 20_000, "steps x requests x Core's 20 s Notion timeout");
+  await h.connect();
+  h.settings({ enabled: true, dryRun: true });
+  // While this runner waits on Notion, another runner takes the lease over (as after an expiry).
+  notion.on(/^POST \/data_sources\/.*\/query$/, () => {
+    h.test.run("UPDATE chores_sync SET lease_token='other-runner',lease_until_ms=?", Date.now() + 120_000);
+    return notionResponse({ object: "list", results: [], has_more: false, next_cursor: null });
+  });
+  await h.slice();
+  const lease = h.test.rows<any>("SELECT lease_token AS token,lease_until_ms AS until,phase FROM chores_sync")[0];
+  assert.equal(lease.token, "other-runner", "the other runner keeps its lease");
+  assert.ok(lease.until > Date.now());
+  assert.equal(lease.phase, "read", "and the first runner's stale step changed nothing");
+}));
+
+test("verifying a different People database keeps the sync row, moves to a new generation, and a slice still running for the old one changes nothing", () => withHarness(async (h, notion) => {
+  await h.connect();
+  h.settings({ enabled: true, dryRun: true });
+  notion.pageSize = 1;
+  seed(notion, ids.peopleSource, [peopleRow({ name: "Test Student A", memberId: "9001" }), peopleRow({ name: "Test Student B", memberId: "9002" })]);
+  await h.slice();
+  const before = h.test.rows<any>("SELECT generation FROM chores_sync")[0].generation;
+  // A second People database, and the Admin verifies it while a slice is still reading the old one.
+  notion.sources.set(ids.otherSource, { ...notion.sources.get(ids.peopleSource), id: ids.otherSource });
+  notion.rows.set(ids.otherSource, []);
+  let verifiedOnce = false;
+  notion.on(new RegExp(`^POST /data_sources/${ids.peopleSource}/query$`), async () => {
+    if (!verifiedOnce) {
+      verifiedOnce = true;
+      h.core.bind("people", { databaseId: ids.peopleDatabase, dataSourceId: ids.otherSource, name: "Other People" });
+      const verified = await h.setup("POST", "/verify", {});
+      assert.equal(verified.status, 200, verified.text);
+    }
+    return notionResponse({ object: "list", results: [peopleRow({ name: "Old Database", memberId: "9001" })], has_more: false, next_cursor: null });
+  });
+  await h.slice();
+  const sync = h.test.rows<any>("SELECT phase,generation,lease_token AS token FROM chores_sync")[0];
+  assert.equal(sync.phase, "idle", "the stale slice did not move the stream on");
+  assert.ok(sync.generation > before, "the generation only grows");
+  assert.equal(sync.token, null);
+  // The next run reads the new, empty database, and nothing from the old one survives it.
+  const slices = await h.runJob(true);
+  assert.equal(slices.at(-1)!.outcome.done, true);
+  assert.equal(h.test.rows<any>("SELECT count(*) AS n FROM chores_people")[0].n, 0, "the old database's rows are gone");
+  assert.ok(h.test.rows<any>("SELECT generation FROM chores_sync")[0].generation > sync.generation);
+}));

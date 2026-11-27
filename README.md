@@ -51,7 +51,7 @@ The roster includes minors. Notion receives only chore, date, person and status 
 
 ## Limits
 
-The `chores.run` job runs every five minutes. Each scheduler slice does one step: one query, one create or one update (two Notion requests when Core first checks a page belongs to People), within Core's slice budget (40 subrequests, 30 D1 queries, 12 provider requests) and its cap of 8 Notion requests per invocation. Under the cron fallback it does up to three steps per run while that cap leaves room.
+The `chores.run` job runs every five minutes. Each scheduler slice does one step: one query, one create or one update (two Notion requests when Core first checks a page belongs to People), within Core's slice budget (40 subrequests, 30 D1 queries, 12 provider requests) and its cap of 8 Notion requests per invocation. Under the cron fallback it does up to three steps per run while that cap leaves room. People is read 25 rows per request to keep each slice's CPU small. A write is marked before it is sent and the mark cleared with its local record, so a write that may have happened without being recorded makes the sync read People again rather than send it twice. Members whose ID is longer than 200 characters are skipped, and when the roster projection returns its full 500 members nobody is unticked, since the list may be cut short; both are recorded as codes in the sync summary.
 
 ## Development
 

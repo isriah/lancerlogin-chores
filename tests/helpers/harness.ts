@@ -14,9 +14,14 @@ export class StatusError extends Error {
   constructor(status: number, message: string) { super(message); this.status = status; }
 }
 
-/** Core's read coalescing and query counting. */
+/**
+ * Core's read coalescing and query counting. `fail`, when set, is asked about each statement before it runs; returning true
+ * makes that statement (or its whole batch) throw as a D1 failure would.
+ */
 export function coreDatabase(test: TestDatabase) {
-  const state = { queries: 0 };
+  const state = { queries: 0, fail: undefined as ((sql: string) => boolean) | undefined };
+  const sqlOf = new WeakMap<object, string>();
+  const check = (sql: string) => { if (state.fail?.(sql)) throw new Error("D1_ERROR: simulated"); };
   const originals = new WeakMap<object, any>();
   let queue: { statement: any; resolve: (result: any) => void; reject: (error: unknown) => void }[] | undefined;
   const flush = (items: NonNullable<typeof queue>) => {
@@ -31,16 +36,17 @@ export function coreDatabase(test: TestDatabase) {
     const reads = /^\s*(SELECT|WITH)\b/i.test(sql);
     const statement: Statement = {
       bind: (...values: unknown[]) => wrap(original.bind(...values), sql),
-      async first<T>() { if (reads) return ((await read(original)).results[0] as T) ?? null; state.queries++; return await original.first() as T; },
-      async all<T>() { if (reads) return await read(original) as { results?: T[] }; state.queries++; return await original.all(); },
-      async run() { state.queries++; return original.run(); },
+      async first<T>() { check(sql); if (reads) return ((await read(original)).results[0] as T) ?? null; state.queries++; return await original.first() as T; },
+      async all<T>() { check(sql); if (reads) return await read(original) as { results?: T[] }; state.queries++; return await original.all(); },
+      async run() { check(sql); state.queries++; return original.run(); },
     };
     originals.set(statement, original);
+    sqlOf.set(statement, sql);
     return statement;
   }
   const db: Database = {
     prepare: (sql: string) => wrap(test.prepare(sql), sql),
-    async batch(statements: Statement[]) { state.queries++; return test.batch(statements.map((statement) => originals.get(statement))); },
+    async batch(statements: Statement[]) { state.queries++; for (const statement of statements) check(sqlOf.get(statement)!); return test.batch(statements.map((statement) => originals.get(statement))); },
   };
   return { db, state };
 }

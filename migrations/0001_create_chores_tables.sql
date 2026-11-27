@@ -172,6 +172,11 @@ CREATE TABLE chores_sync (
   watermark TEXT,
   next_due_ms INTEGER NOT NULL DEFAULT 0 CHECK(typeof(next_due_ms) = 'integer'),
   lease_until_ms INTEGER NOT NULL DEFAULT 0 CHECK(typeof(lease_until_ms) = 'integer'),
+  -- The runner holding the lease. Only that runner releases it.
+  lease_token TEXT,
+  -- Set just before a Notion write and cleared with the local record of it. Found set, the write may have happened without
+  -- being recorded, so the stream reads Notion again instead of planning the same write twice.
+  pending_write TEXT,
   started_ms INTEGER CHECK(started_ms IS NULL OR typeof(started_ms) = 'integer'),
   finished_ms INTEGER CHECK(finished_ms IS NULL OR typeof(finished_ms) = 'integer'),
   last_error TEXT,

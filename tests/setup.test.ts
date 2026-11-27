@@ -178,3 +178,17 @@ test("the People view link must be a Notion https link", () => withHarness(async
   assert.equal(saved.body.needsAccountViewUrl, "https://www.notion.so/test-view?v=1");
   assert.equal((await h.setup("PUT", "/view", { url: null })).body.needsAccountViewUrl, null);
 }));
+
+test("a failure that isn't Notion's while reading the test row back still trashes the row and records the outcome", () => withHarness(async (h, notion) => {
+  await h.connect();
+  const service = h.core.service;
+  // Core's page read throws something unexpected (not a Notion error).
+  h.core.service = (cost) => ({ ...service(cost), page: async () => { throw new TypeError("unexpected"); } }) as any;
+  await assert.rejects(h.setup("POST", "/person-write-check", { notionUserId: personA }), /unexpected/);
+  h.core.service = service;
+  const created = [...notion.pages.values()].filter((page) => page.parent.data_source_id === ids.logSource);
+  assert.equal(created.length, 1);
+  assert.equal(created[0]!.in_trash, true, "the test row was trashed");
+  const row = h.test.rows<any>("SELECT write_check_state AS state,write_check_code AS code,write_check_cleanup AS cleanup FROM chores_notion")[0];
+  assert.deepEqual(row, { state: "failed", code: "read_failed", cleanup: "trashed" });
+}));
