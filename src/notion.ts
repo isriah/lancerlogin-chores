@@ -4,15 +4,15 @@
 // decoded; `filter_properties` silently returns rows without the property; a page is created with properties only.
 //
 // Writes go only through the typed methods of ChoresNotion, and each checks its properties against an allow-list built from
-// the checked layout before anything reaches Core. In People that list is Name, LancerLogin member ID, Active and Suggested
-// account: the Notion account column belongs to people, and Chores never writes it. Schema checks require only the listed
-// properties and ignore any others (such as a "Board column" formula), which are never written.
+// the checked layout before anything reaches Core. Schema checks require only the listed properties and ignore any others
+// (such as a "Board column" formula), which are never written. The People database is Core's (SDK 1.10.0): Core keeps it in
+// step with the roster and Chores reads the matches from Core, so Chores has no People binding and never writes People.
 import type { NotionService } from "@lancerlogin/module-sdk/api";
 
 /** The bindings declared in the manifest's `notion.bindings`. */
-export const bindingIds = ["chores", "log", "people", "task"] as const;
+export const bindingIds = ["chores", "log"] as const;
 export type BindingId = (typeof bindingIds)[number];
-export const requiredBindings: readonly BindingId[] = ["chores", "log", "people"];
+export const requiredBindings: readonly BindingId[] = ["chores", "log"];
 
 export class AppError extends Error {
   readonly code: string;
@@ -44,24 +44,13 @@ export const logLayout = {
   name: ["Name", "title"], date: ["Date", "date"], chore: ["Chore", "relation"], person: ["Person", "people"], status: ["Status", "select"],
   done: ["Done", "checkbox"], assignedBy: ["Assigned by", "rich_text"],
 } as const;
-export const peopleLayout = {
-  name: ["Name", "title"], memberId: ["LancerLogin member ID", "rich_text"], account: ["Notion account", "people"],
-  suggested: ["Suggested account", "people"], active: ["Active", "checkbox"],
-} as const;
 export const logStatuses = ["Assigned", "Replacement", "Reassigned (not checked in)"] as const;
 
 export type ChoresField = keyof typeof choresLayout;
 export type LogField = keyof typeof logLayout;
-export type PeopleField = keyof typeof peopleLayout;
 export type LogStatus = (typeof logStatuses)[number];
-export type TaskSchema = { readonly databaseId: string; readonly dataSourceId: string; readonly name?: string; readonly peoplePropertyIds: readonly string[] };
-export type Schema = {
-  readonly chores: SourceSchema<ChoresField>; readonly log: SourceSchema<LogField>; readonly people: SourceSchema<PeopleField>;
-  readonly task?: TaskSchema;
-};
+export type Schema = { readonly chores: SourceSchema<ChoresField>; readonly log: SourceSchema<LogField> };
 
-/** The only People properties Chores may write. "Notion account" is deliberately absent. */
-export const peopleWritable: readonly PeopleField[] = ["name", "memberId", "active", "suggested"];
 /** The Chore log properties Chores may write. Done is ticked by members in Notion and only ever read. */
 export const logWritable: readonly LogField[] = ["name", "date", "chore", "person", "status", "assignedBy"];
 
@@ -111,7 +100,6 @@ export function mapSource<Field extends string>(label: string, layout: Readonly<
 }
 
 export const mapChores = (source: Json, databaseId: string, listedName?: string) => mapSource("Chores database", choresLayout, source, databaseId, listedName);
-export const mapPeople = (source: Json, databaseId: string, listedName?: string) => mapSource("People database", peopleLayout, source, databaseId, listedName);
 
 /** The Chore log needs its three Status options, and Chore must relate to the Chores database when Notion says where it points. */
 export function mapLog(source: Json, databaseId: string, choresDataSourceId: string, listedName?: string): SourceSchema<LogField> {
@@ -124,13 +112,6 @@ export function mapLog(source: Json, databaseId: string, choresDataSourceId: str
   return schema;
 }
 
-/** The optional task database only needs a people property to scan. */
-export function mapTask(source: Json, databaseId: string, listedName?: string): TaskSchema {
-  const peoplePropertyIds = (Object.values(source.properties ?? {}) as Json[]).filter((property) => property?.type === "people").map((property) => String(property.id));
-  if (!peoplePropertyIds.length) throw new AppError("Task database: it needs at least one people property to suggest accounts from.", "schema");
-  return { databaseId, dataSourceId: String(source.id), ...named(listedName || sourceTitle(source)), peoplePropertyIds };
-}
-
 /** The Status option to write, by its existing ID. A name that is not already an option is refused, never created. */
 export function statusValue(schema: Schema, status: string): Json {
   const option = schema.log.properties.status.options?.find((item) => item.name === status);
@@ -138,28 +119,11 @@ export function statusValue(schema: Schema, status: string): Json {
   return { select: { id: option.id } };
 }
 
-const text = (value: string) => [{ type: "text", text: { content: value } }];
-
-export type PeopleValues = { readonly name?: string; readonly memberId?: string; readonly active?: boolean; readonly suggested?: readonly string[] };
-
-/** People properties for the given values, keyed by property ID. */
-export function peopleProperties(schema: Schema, values: PeopleValues): Json {
-  const map = schema.people.properties;
-  const properties: Json = {};
-  if (values.name !== undefined) properties[map.name.id] = { title: text(values.name.slice(0, 2000)) };
-  if (values.memberId !== undefined) properties[map.memberId.id] = { rich_text: text(values.memberId.slice(0, 2000)) };
-  if (values.active !== undefined) properties[map.active.id] = { checkbox: values.active };
-  if (values.suggested !== undefined) properties[map.suggested.id] = { people: values.suggested.map((id) => ({ object: "user", id })) };
-  return properties;
-}
-
-/** Refuse any property outside the allow-list, before anything is sent. */
-export function assertWritable(schema: Schema, target: "people" | "log", properties: Json): void {
-  const source = target === "people" ? schema.people : schema.log;
-  const allowed = new Set((target === "people" ? peopleWritable : logWritable).map((field) => decodedId((source.properties as Record<string, PropertyMapping>)[field]!.id)));
-  const forbidden = target === "people" ? decodedId(schema.people.properties.account.id) : undefined;
+/** Refuse any Chore log property outside the allow-list, before anything is sent. */
+export function assertWritable(schema: Schema, properties: Json): void {
+  const allowed = new Set(logWritable.map((field) => decodedId(schema.log.properties[field].id)));
   const keys = Object.keys(properties);
-  if (!keys.length || keys.some((key) => !allowed.has(decodedId(key)) || decodedId(key) === forbidden)) throw new AppError("Chores may not write that Notion property.", "write_not_allowed");
+  if (!keys.length || keys.some((key) => !allowed.has(decodedId(key)))) throw new AppError("Chores may not write that Notion property.", "write_not_allowed");
 }
 
 const statusMessage = (status: number) => status === 401 ? "Notion rejected the token saved in Core. An Admin needs to save a new one in Settings > Integrations > Notion."
@@ -216,7 +180,7 @@ export type CreatedPage = { readonly id: string; readonly url?: string };
 /** Notion requests Core lets one invocation send (`notionCallsPerInvocation` in Core). */
 export const notionCallsPerInvocation = 8;
 
-const bindingLabel = (binding: BindingId) => binding === "log" ? "Chore log" : binding === "people" ? "People" : binding === "task" ? "task" : "Chores";
+const bindingLabel = (binding: BindingId) => binding === "log" ? "Chore log" : "Chores";
 
 /**
  * Chores' databases through Core's bindings. Each method is one Notion request, except an update or trash of a page Core has
@@ -252,7 +216,7 @@ export class ChoresNotion {
   }
 
   /**
-   * Every bound database's layout, checked: at most four requests. Each failure names its binding, so the page can point at
+   * Every bound database's layout, checked: two requests. Each failure names its binding, so the page can point at
    * the right picker. An unbound required binding is refused before its request.
    */
   async readSchema(): Promise<Schema> {
@@ -272,13 +236,8 @@ export class ChoresNotion {
     const choresSchema = tagged("chores", () => mapChores(chores.source, chores.databaseId, chores.name));
     const log = await need("log");
     const logSchema = tagged("log", () => mapLog(log.source, log.databaseId, choresSchema.dataSourceId, log.name));
-    const people = await need("people");
-    const peopleSchema = tagged("people", () => mapPeople(people.source, people.databaseId, people.name));
-    const found = await read("task");
-    const task = found ? tagged("task", () => mapTask(found.source, found.databaseId, found.name)) : undefined;
-    const ids = [choresSchema.dataSourceId, logSchema.dataSourceId, peopleSchema.dataSourceId, ...(task ? [task.dataSourceId] : [])].map((id) => canonicalId(id) ?? id);
-    if (new Set(ids).size !== ids.length) throw Object.assign(new AppError("Each Chores binding must be a different Notion database.", "schema"), { field: "people" });
-    return { chores: choresSchema, log: logSchema, people: peopleSchema, ...(task ? { task } : {}) };
+    if ((canonicalId(choresSchema.dataSourceId) ?? choresSchema.dataSourceId) === (canonicalId(logSchema.dataSourceId) ?? logSchema.dataSourceId)) throw Object.assign(new AppError("The Chores database and the Chore log must be different Notion databases.", "schema"), { field: "log" });
+    return { chores: choresSchema, log: logSchema };
   }
 
   /**
@@ -293,8 +252,8 @@ export class ChoresNotion {
     return { results: page.results, ...(page.nextCursor ? { next: page.nextCursor } : {}) };
   }
 
-  async #create(binding: "people" | "log", properties: Json): Promise<CreatedPage> {
-    const page = await this.#call(1, () => this.#notion.createPage(binding, { properties }));
+  async #create(properties: Json): Promise<CreatedPage> {
+    const page = await this.#call(1, () => this.#notion.createPage("log", { properties }));
     const id = canonicalId(page.id);
     if (!id) throw new AppError("Notion accepted the request, but did not return the new page. Check the database.", "notion_response", true);
     this.#remember(id);
@@ -302,25 +261,10 @@ export class ChoresNotion {
     return { id, ...(url ? { url } : {}) };
   }
 
-  /** Create a People row for a member: Name, LancerLogin member ID and Active ticked. Never Notion account. */
-  async createPeopleRow(schema: Schema, values: { readonly name: string; readonly memberId: string }): Promise<CreatedPage> {
-    const properties = peopleProperties(schema, { name: values.name, memberId: values.memberId, active: true });
-    assertWritable(schema, "people", properties);
-    return this.#create("people", properties);
-  }
-
-  /** Change allow-listed People properties on one row. */
-  async updatePeopleRow(schema: Schema, id: string, values: PeopleValues): Promise<void> {
-    const properties = peopleProperties(schema, values);
-    assertWritable(schema, "people", properties);
-    const page = pageId(id);
-    await this.#call(this.writeCost(page), () => this.#notion.updatePage("people", page, { properties }));
-  }
-
   /** Create one Chore log row from allow-listed properties. */
   async createLogRow(schema: Schema, properties: Json): Promise<CreatedPage> {
-    assertWritable(schema, "log", properties);
-    return this.#create("log", properties);
+    assertWritable(schema, properties);
+    return this.#create(properties);
   }
 
   /** One Chore log row. Core refuses a page of any other database. */

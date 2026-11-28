@@ -4,14 +4,14 @@ export const integrationsPath = "/settings/integrations";
 export const integrationsLabel = "Settings > Integrations > Notion";
 export const settingsPath = "/settings/chores";
 
-export type BindingId = "chores" | "log" | "people" | "task";
+export type BindingId = "chores" | "log";
 export type CoreNotion = { readonly connected: boolean; readonly saved: boolean; readonly enabled: boolean; readonly readable: boolean; readonly pausedUntilMs: number | null };
 export type WriteCheck = { readonly state: "passed" | "failed" | "uncertain" | null; readonly checkedMs: number | null; readonly code: string | null; readonly cleanup: "trashed" | "failed" | "none" | null; readonly pageUrl: string | null };
 export type SetupStatus = {
   readonly core: CoreNotion;
   readonly bindings: Readonly<Record<BindingId, { readonly name: string | null; readonly databaseId: string } | null>>;
   readonly verifiedMs: number | null; readonly schemaError: string | null; readonly problem: string | null; readonly rejectedMs: number | null;
-  readonly taskVerified: boolean; readonly needsAccountViewUrl: string | null; readonly writeCheck: WriteCheck;
+  readonly writeCheck: WriteCheck;
 };
 export type PeopleAccount = { readonly name: string; readonly notionUserId: string; readonly memberId: string };
 
@@ -19,8 +19,6 @@ export type PeopleAccount = { readonly name: string; readonly notionUserId: stri
 export const bindingGuide: readonly { readonly id: BindingId; readonly label: string; readonly layout: readonly (readonly [string, string])[] }[] = [
   { id: "chores", label: "Chores database", layout: [["Name", "title"], ["Area", "select"], ["Active", "checkbox"], ["People needed", "number"], ["Days", "multi-select"], ["Notes", "rich text"]] },
   { id: "log", label: "Chore log database", layout: [["Name", "title"], ["Date", "date"], ["Chore", "relation to the Chores database"], ["Person", "people"], ["Status", "select with Assigned, Replacement and Reassigned (not checked in)"], ["Done", "checkbox, ticked by members"], ["Assigned by", "rich text"]] },
-  { id: "people", label: "People database", layout: [["Name", "title"], ["LancerLogin member ID", "rich text"], ["Notion account", "people, filled in by people, never by Chores"], ["Suggested account", "people"], ["Active", "checkbox"]] },
-  { id: "task", label: "Task database (optional)", layout: [["Any people property", "read only, to suggest accounts"]] },
 ];
 
 /** Notion's capabilities, in Notion's words, that Core's connection needs for Chores. */
@@ -31,7 +29,7 @@ export const setupNotes: readonly string[] = [
   "Chores go to members checked in at a required meeting. Optional meetings get no chores.",
   "If a member forgot to scan, a coach checks them in from the dashboard: that counts as present. An attendance correction does not count, so use check-in, not a correction, for someone who is in the shop.",
   "Picking goes by the days each member has been assigned a chore, whether or not they ticked Done. Done is shown as credit and for follow-up.",
-  "Notion receives only the chore, date, person and status in the Chore log, and names and member IDs in People. No check-in times leave LancerLogin.",
+  "Chores sends Notion only the chore, date, person and status in the Chore log. No check-in times leave LancerLogin.",
 ];
 
 export const connected = (status: SetupStatus) => status.problem === null || status.problem === "notion_token_rejected" || status.problem === "notion_access_lost";
@@ -47,7 +45,6 @@ export function problemText(status: SetupStatus): string | undefined {
     case "notion_disabled": return `Core's Notion connection is turned off. Turn it on in ${integrationsLabel}.`;
     case "chores_unbound": return "Choose the Chores database below.";
     case "log_unbound": return "Choose the Chore log database below.";
-    case "people_unbound": return "Choose the People database below.";
     case "not_verified": return "The chosen databases have not been checked for Chores yet. Verify them below.";
     case "notion_schema_changed": return `A Notion database no longer matches what Chores expects.${status.schemaError ? ` ${status.schemaError}` : ""} Fix it in Notion, then verify again.`;
     case "notion_token_rejected": return `Notion rejected the token saved in Core${when}. Save a new token in ${integrationsLabel}.`;

@@ -92,18 +92,16 @@ export function createHarness(api: any) {
   const setup = (method: string, path: string, body?: unknown) => call(method, `/module-setup/chores${path}`, { body, origin: dashboard });
   const admin = (method: string, path: string, body?: unknown, role: "admin" | "operator" = "admin") => call(method, `/admin/chores${path}`, { body, origin: dashboard, role });
 
-  /** Core's connection with the three required bindings (and the task database when asked), as an Admin leaves them. */
-  function bindAll(withTask = false) {
+  /** Core's connection with both bindings, as an Admin leaves them. */
+  function bindAll() {
     core.connect();
     core.bind("chores", { databaseId: ids.choresDatabase, dataSourceId: ids.choresSource, name: "Test Chores" });
     core.bind("log", { databaseId: ids.logDatabase, dataSourceId: ids.logSource, name: "Test Chore log" });
-    core.bind("people", { databaseId: ids.peopleDatabase, dataSourceId: ids.peopleSource, name: "Test People" });
-    if (withTask) core.bind("task", { databaseId: ids.taskDatabase, dataSourceId: ids.taskSource, name: "Test Tasks" });
   }
 
   /** Bind, then the real verify route. */
-  async function connect(withTask = false) {
-    bindAll(withTask);
+  async function connect() {
+    bindAll();
     const verified = await setup("POST", "/verify", {});
     if (verified.status !== 200) throw new Error(`verify ${verified.text}`);
   }
@@ -115,25 +113,5 @@ export function createHarness(api: any) {
     if (values.dryRun !== undefined) test.run("UPDATE chores_settings SET dry_run=? WHERE installation_id='primary'", values.dryRun ? 1 : 0);
   }
 
-  /** One scheduler slice of the job, with what it spent. */
-  async function slice(steps = true): Promise<{ outcome: any; cost: SliceCost }> {
-    const before = state.queries;
-    const context = { db, services: services(), scheduler: { steps } };
-    const outcome = await api.jobs["chores.run"](context);
-    const d1 = state.queries - before + lastCost.d1;
-    return { outcome, cost: { d1, external: lastCost.external, notion: lastCost.notion, total: d1 + lastCost.external } };
-  }
-
-  /** The job until it stops asking for more, as the scheduler would run it. */
-  async function runJob(steps = true, limit = 200) {
-    const slices: { outcome: any; cost: SliceCost }[] = [];
-    for (let run = 0; run < limit; run++) {
-      const result = await slice(steps);
-      slices.push(result);
-      if (!result.outcome?.more) break;
-    }
-    return slices;
-  }
-
-  return { test, db, state, core, services, call, setup, admin, bindAll, connect, settings, slice, runJob };
+  return { test, db, state, core, services, call, setup, admin, bindAll, connect, settings };
 }

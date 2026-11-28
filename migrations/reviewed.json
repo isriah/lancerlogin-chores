@@ -2,5 +2,9 @@
   {
     "name": "0001_create_chores_tables.sql",
     "sha256": "a6c699871adce17c0d0039b526da2064f4ba632da1a50cb5b5979465234558a1"
+  },
+  {
+    "name": "0002_people_matching_moved_to_core.sql",
+    "sha256": "342a17fcef2171dbf9c62b9c8ef3ee78dec319e38c6ceb7f5f94be25f26428f1"
   }
 ]

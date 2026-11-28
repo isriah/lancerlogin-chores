@@ -5,8 +5,8 @@ import { bindingGuide, connected, problemText, setupNotes, writeCheckPassed, wri
 
 const status = (overrides: Partial<SetupStatus> = {}): SetupStatus => ({
   core: { connected: true, saved: true, enabled: true, readable: true, pausedUntilMs: null },
-  bindings: { chores: { name: "Test Chores", databaseId: "x" }, log: { name: "Test Chore log", databaseId: "y" }, people: { name: "Test People", databaseId: "z" }, task: null },
-  verifiedMs: 1, schemaError: null, problem: null, rejectedMs: null, taskVerified: false, needsAccountViewUrl: null,
+  bindings: { chores: { name: "Test Chores", databaseId: "x" }, log: { name: "Test Chore log", databaseId: "y" } },
+  verifiedMs: 1, schemaError: null, problem: null, rejectedMs: null,
   writeCheck: { state: null, checkedMs: null, code: null, cleanup: null, pageUrl: null }, ...overrides,
 });
 
@@ -20,7 +20,7 @@ test("setup notes tell coaches to check people in from the dashboard, not with a
 
 test("every problem points at the fix, and the token always at Settings > Integrations > Notion", () => {
   for (const problem of ["notion_not_configured", "notion_unreadable", "notion_disabled", "notion_token_rejected"]) assert.match(problemText(status({ problem }))!, /Settings > Integrations > Notion/);
-  assert.match(problemText(status({ problem: "people_unbound" }))!, /People database/);
+  assert.match(problemText(status({ problem: "log_unbound" }))!, /Chore log database/);
   assert.match(problemText(status({ problem: "notion_schema_changed", schemaError: "Chore log: the property \"Done\" must exist." }))!, /Done/);
   assert.equal(problemText(status()), undefined);
   assert.equal(connected(status({ problem: "not_verified" })), false);
@@ -33,8 +33,8 @@ test("the write check result reads plainly, including an uncertain create to cle
   assert.match(writeCheckText({ state: "failed", checkedMs: null, code: "person_not_saved", cleanup: "failed", pageUrl: "https://www.notion.so/x" })!, /delete it in Notion/);
 });
 
-test("the guide lists each binding once, in the manifest's order, and says Notion account is never written by Chores", async () => {
+test("the guide lists each binding once, in the manifest's order, and Chores has no People or task database of its own", async () => {
   const { default: manifest } = await import("../src/manifest.ts");
   assert.deepEqual(bindingGuide.map((binding) => binding.id), manifest.notion.bindings.map((binding) => binding.id));
-  assert.match(JSON.stringify(bindingGuide.find((binding) => binding.id === "people")), /never by Chores/);
+  assert.deepEqual(bindingGuide.map((binding) => binding.id), ["chores", "log"]);
 });

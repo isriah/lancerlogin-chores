@@ -19,7 +19,7 @@ test("status before Core's connection exists points at Settings > Integrations >
   assert.equal(status.status, 200);
   assert.equal(status.body.problem, "notion_not_configured");
   assert.equal(status.body.core.connected, false);
-  assert.deepEqual(status.body.bindings, { chores: null, log: null, people: null, task: null });
+  assert.deepEqual(status.body.bindings, { chores: null, log: null });
   assert.equal(notion.calls.length, 0);
   assert.doesNotMatch(status.text, /ntn_|token/i);
 }));
@@ -43,14 +43,13 @@ test("verify refuses until every required binding is chosen, naming the first mi
   assert.equal(await stepDone(h, "notion-connection"), false);
 }));
 
-test("verify reads every bound database through Core (at most four requests), allows extra properties and completes step 1", () => withHarness(async (h, notion) => {
-  h.bindAll(true);
+test("verify reads both bound databases through Core (two requests), allows extra properties and completes step 1", () => withHarness(async (h, notion) => {
+  h.bindAll();
   const verify = await h.setup("POST", "/verify", {});
   assert.equal(verify.status, 200, verify.text);
   assert.equal(verify.body.problem, null);
   assert.ok(verify.body.verifiedMs);
-  assert.equal(verify.body.taskVerified, true);
-  assert.deepEqual(notion.calls.map((call) => `${call.method} ${call.path}`), [ids.choresSource, ids.logSource, ids.peopleSource, ids.taskSource].map((id) => `GET /data_sources/${id}`));
+  assert.deepEqual(notion.calls.map((call) => `${call.method} ${call.path}`), [ids.choresSource, ids.logSource].map((id) => `GET /data_sources/${id}`));
   assert.equal(await stepDone(h, "notion-connection"), true);
   assert.equal(await stepDone(h, "person-write-check"), false);
   assert.equal(h.test.rows("SELECT action FROM audit_log").map((row: any) => row.action).join(), "chores.connection_verified");
@@ -58,23 +57,22 @@ test("verify reads every bound database through Core (at most four requests), al
 
 test("a layout mismatch saves nothing and names the binding; a binding moved in Core needs verifying again", () => withHarness(async (h, notion) => {
   h.bindAll();
-  const people = notion.sources.get(ids.peopleSource);
-  people.properties["LancerLogin member ID"].type = "number";
+  const log = notion.sources.get(ids.logSource);
+  log.properties["Assigned by"].type = "number";
   const refused = await h.setup("POST", "/verify", {});
   assert.equal(refused.status, 422);
   assert.equal(refused.body.code, "schema_mismatch");
-  assert.equal(refused.body.field, "people");
+  assert.equal(refused.body.field, "log");
   assert.equal(await stepDone(h, "notion-connection"), false);
 
-  people.properties["LancerLogin member ID"].type = "rich_text";
+  log.properties["Assigned by"].type = "rich_text";
   assert.equal((await h.setup("POST", "/verify", {})).status, 200);
   // An Admin picks another Chores database in Core: the saved layouts no longer describe what is bound.
   h.core.bind("chores", { databaseId: ids.choresDatabase, dataSourceId: ids.otherSource, name: "Other" });
   assert.equal((await h.setup("GET", "/status")).body.problem, "not_verified");
-  // Choosing a task database later also needs a new check.
+  // Back on the database it checked, it verifies again.
   h.core.bind("chores", { databaseId: ids.choresDatabase, dataSourceId: ids.choresSource, name: "Test Chores" });
-  h.core.bind("task", { databaseId: ids.taskDatabase, dataSourceId: ids.taskSource, name: "Test Tasks" });
-  assert.equal((await h.setup("GET", "/status")).body.problem, "not_verified");
+  assert.equal((await h.setup("POST", "/verify", {})).status, 200);
 }));
 
 test("the Person-write check creates one TEST row with Person set, reads it back, trashes only it, through Core, in four requests", () => withHarness(async (h, notion) => {
@@ -155,28 +153,30 @@ test("the write check refuses before verifying, and counts only for the Chore lo
   assert.equal(await stepDone(h, "person-write-check"), false);
 }));
 
-test("the People accounts list for the write check is one request and leaves out email addresses", () => withHarness(async (h, notion) => {
+test("the write check's account choices come from Core's people matching: no Notion request, and a refusal until it is set up", () => withHarness(async (h, notion) => {
   await h.connect();
-  const { peopleRow, seed } = await import("./helpers/notion-stub.ts");
-  seed(notion, ids.peopleSource, [
-    peopleRow({ name: "Test Student A", memberId: "9001", accounts: [{ id: personA, name: "Test Student A" }] }),
-    peopleRow({ name: "Test Student B", memberId: "9002" }),
-  ]);
+  const { peopleAccounts } = await import("./helpers/module-sdk-stub.ts");
   notion.calls.length = 0;
-  const accounts = await h.setup("POST", "/people-accounts", {});
-  assert.equal(accounts.status, 200);
-  assert.deepEqual(accounts.body.accounts, [{ name: "Test Student A", notionUserId: personA, memberId: "9001" }]);
-  assert.equal(notion.calls.length, 1);
-  assert.doesNotMatch(accounts.text, /example\.test/);
-}));
-
-test("the People view link must be a Notion https link", () => withHarness(async (h) => {
-  await h.connect();
-  assert.equal((await h.setup("PUT", "/view", { url: "https://evil.example.test/x" })).status, 400);
-  const saved = await h.setup("PUT", "/view", { url: "https://www.notion.so/test-view?v=1" });
-  assert.equal(saved.status, 200);
-  assert.equal(saved.body.needsAccountViewUrl, "https://www.notion.so/test-view?v=1");
-  assert.equal((await h.setup("PUT", "/view", { url: null })).body.needsAccountViewUrl, null);
+  try {
+    peopleAccounts.rows = undefined;
+    const missing = await h.setup("POST", "/people-accounts", {});
+    assert.equal(missing.status, 409);
+    assert.equal(missing.body.code, "people_not_set_up");
+    assert.match(missing.body.error, /Settings > Integrations > Notion/);
+    // Matched or not, a row with one account can be the test account. Only the name, the account and the typed member ID go out.
+    peopleAccounts.rows = [
+      { memberId: "member-internal-1", externalId: "9001", name: "Test Student A", notionUserId: personA, matched: true },
+      { memberId: null, externalId: "TEST-001", name: "<img src=x onerror=alert(1)>", notionUserId: "c0000000-0000-4000-8000-00000000000b", matched: false },
+    ];
+    const accounts = await h.setup("POST", "/people-accounts", {});
+    assert.equal(accounts.status, 200);
+    assert.deepEqual(accounts.body.accounts, [
+      { name: "Test Student A", notionUserId: personA, memberId: "9001" },
+      { name: "<img src=x onerror=alert(1)>", notionUserId: "c0000000-0000-4000-8000-00000000000b", memberId: "TEST-001" },
+    ]);
+    assert.doesNotMatch(accounts.text, /member-internal-1|example\.test/);
+    assert.equal(notion.calls.length, 0);
+  } finally { peopleAccounts.rows = undefined; }
 }));
 
 test("a failure that isn't Notion's while reading the test row back still trashes the row and records the outcome", () => withHarness(async (h, notion) => {
