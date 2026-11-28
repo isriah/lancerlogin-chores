@@ -29,7 +29,7 @@ export function DatabasesCard({ status, onStatus, onVerified, heading = "step" }
   const [result, setResult] = useState<{ notice: NoticeValue; key: number }>();
   const ok = connected(status);
   const problem = problemText(status);
-  const canVerify = status.core.connected && Boolean(status.bindings.chores && status.bindings.log && status.bindings.people);
+  const canVerify = status.core.connected && Boolean(status.bindings.chores && status.bindings.log);
 
   async function reload() {
     try { onStatus(await request<SetupStatus>(`${setupRoute}/status`)); } catch (caught) { setError(errorText(caught, "Chores setup could not be loaded.")); }
@@ -58,7 +58,7 @@ export function DatabasesCard({ status, onStatus, onVerified, heading = "step" }
       {bindingGuide.map((binding) => <div className="ch-binding" key={binding.id}>
         <NotionBindingField moduleId="chores" bindingId={binding.id} onChanged={(bound) => { if (bound !== Boolean(status.bindings[binding.id])) void reload(); }} />
         <details className="settings-disclosure">
-          <summary>What the {binding.label.replace(" (optional)", "")} needs</summary>
+          <summary>What the {binding.label} needs</summary>
           <ul className="ch-layout">{binding.layout.map(([field, kind]) => <li key={field}><strong>{field}</strong>: {kind}</li>)}</ul>
         </details>
       </div>)}
@@ -70,7 +70,7 @@ export function DatabasesCard({ status, onStatus, onVerified, heading = "step" }
   </section>;
 }
 
-/** Step 2: choose a test account from People, then create, read back and trash one TEST row in the Chore log. */
+/** Step 2: choose a test account from Core's copy of People, then create, read back and trash one TEST row in the Chore log. */
 export function WriteCheckCard({ status, onStatus, onPassed, heading = "step" }: { status: SetupStatus; onStatus: (status: SetupStatus) => void; onPassed?: () => Promise<void> | void; heading?: "step" | "card" }) {
   const ids = useId();
   const [accounts, setAccounts] = useState<readonly PeopleAccount[]>();
@@ -112,10 +112,10 @@ export function WriteCheckCard({ status, onStatus, onPassed, heading = "step" }:
         <select id={`${ids}account`} value={chosen} onChange={(event) => setChosen(event.target.value)}>
           {accounts.map((account) => <option key={account.notionUserId} value={account.notionUserId}>{account.name || "No name"}{account.memberId ? ` (${account.memberId})` : ""}</option>)}
         </select>
-        <span className="field-help">People rows with one Notion account filled in.</span>
+        <span className="field-help">People rows with one Notion account filled in, as of the last People sync.</span>
         <div className="module-actions"><button className="ui-button ui-button--primary" type="button" disabled={busy || !chosen} onClick={() => void run()}>{busy ? "Checking..." : passed ? "Run the check again" : "Run the check"}</button></div>
       </div>
-      : <p className="field-help ch-notice">No People row has a Notion account yet. Fill in Notion account on the test person's row in People, then try again.</p>)}
+      : <p className="field-help ch-notice">No People row has a Notion account yet. Fill in Notion account on the test person's row in the People database, run a People sync in <a href={integrationsPath}>{integrationsLabel}</a>, then try again.</p>)}
     {error && <Notice notice={{ tone: "error", content: error }} focusKey={error} />}
   </section>;
 }

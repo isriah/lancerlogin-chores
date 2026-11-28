@@ -2,14 +2,14 @@
 //
 // Core holds the Notion token (Settings > Integrations > Notion) and the database an Admin chose for each of Chores'
 // bindings; every Notion request goes through `services.notion`. Chores keeps only what is its own: the checked layout of
-// the bound databases, when it was checked, what Notion last refused, the People view link and the Person-write check.
+// the bound databases, when it was checked, what Notion last refused and the Person-write check. Who is which Notion
+// account is Core's too (people matching, SDK 1.10.0): the write check's account choices come from Core's copy of People.
 //
 // These routes live under /module-setup, not /admin: Core refuses /admin/<module> until setup is complete, and they are how
 // setup completes. Core keeps /module-setup open to Admins afterwards.
-import type { NotionBinding, NotionService, NotionServiceStatus } from "@lancerlogin/module-sdk/api";
+import { listNotionPeopleAccounts, type D1Database, type NotionBinding, type NotionService, type NotionServiceStatus } from "@lancerlogin/module-sdk/api";
 import { audit, installationId, json, object, refuse, type Database, type Statement } from "./http.ts";
-import { AppError, ChoresNotion, bindingIds, canonicalId, requiredBindings, validNotionUrl, type BindingId, type Schema } from "./notion.ts";
-import { readPeopleAccounts, resetPeopleSyncStatements } from "./people.ts";
+import { AppError, ChoresNotion, bindingIds, canonicalId, requiredBindings, type BindingId, type Schema } from "./notion.ts";
 import { personWriteCheck } from "./write-check.ts";
 
 /** What Core gives a route or job. */
@@ -17,13 +17,13 @@ export type NotionServices = { readonly notion: NotionService };
 
 export type ConnectionRow = {
   readonly schemaJson: string | null; readonly verifiedMs: number | null; readonly schemaError: string | null;
-  readonly rejectionCode: string | null; readonly rejectedMs: number | null; readonly viewUrl: string | null;
+  readonly rejectionCode: string | null; readonly rejectedMs: number | null;
   readonly writeCheckMs: number | null; readonly writeCheckState: string | null; readonly writeCheckCode: string | null;
   readonly writeCheckCleanup: string | null; readonly writeCheckPageUrl: string | null; readonly writeCheckLogSource: string | null;
 };
 
 export const readConnection = (db: Database) => db.prepare(`SELECT schema_json AS schemaJson,verified_ms AS verifiedMs,schema_error AS schemaError,
-  rejection_code AS rejectionCode,rejected_ms AS rejectedMs,needs_account_view_url AS viewUrl,write_check_ms AS writeCheckMs,write_check_state AS writeCheckState,
+  rejection_code AS rejectionCode,rejected_ms AS rejectedMs,write_check_ms AS writeCheckMs,write_check_state AS writeCheckState,
   write_check_code AS writeCheckCode,write_check_cleanup AS writeCheckCleanup,write_check_page_url AS writeCheckPageUrl,write_check_log_source AS writeCheckLogSource
   FROM chores_notion WHERE installation_id=?`).bind(installationId).first<ConnectionRow>();
 
@@ -44,11 +44,11 @@ export async function readCore(notion: NotionService): Promise<CoreState> {
 
 const sameId = (a: unknown, b: unknown) => canonicalId(a) !== undefined && canonicalId(a) === canonicalId(b);
 
-/** The saved layouts describe the databases Core has bound now, the optional task database included or left out alike. */
+/** The saved layouts describe the databases Core has bound now. */
 export function verifiedForBindings(row: ConnectionRow | null, core: CoreState): boolean {
   const schema = parseSchema(row);
   if (!schema || !row?.verifiedMs) return false;
-  const checked: Record<BindingId, string | undefined> = { chores: schema.chores?.dataSourceId, log: schema.log?.dataSourceId, people: schema.people?.dataSourceId, task: schema.task?.dataSourceId };
+  const checked: Record<BindingId, string | undefined> = { chores: schema.chores?.dataSourceId, log: schema.log?.dataSourceId };
   return bindingIds.every((id) => core.bindings[id] ? sameId(checked[id], core.bindings[id]!.dataSourceId) : checked[id] === undefined);
 }
 
@@ -131,11 +131,10 @@ const coreMessages: Readonly<Record<string, string>> = {
 };
 
 /**
- * Save the checked layouts. A different Chore log needs the Person-write check again; a different People database empties
- * the copy of People and has the sync start from the top. Verifying clears a recorded refusal: it has just read everything.
+ * Save the checked layouts. A different Chore log needs the Person-write check again. Verifying clears a recorded refusal:
+ * it has just read everything.
  */
-const connectionStatements = (db: Database, schema: Schema, previous: Schema | undefined, actor: string, now: number): Statement[] => {
-  const peopleChanged = !sameId(previous?.people.dataSourceId, schema.people.dataSourceId);
+const connectionStatements = (db: Database, schema: Schema, actor: string, now: number): Statement[] => {
   return [
     db.prepare(`INSERT INTO chores_notion(installation_id,schema_json,verified_ms,updated_ms) VALUES (?1,?2,?3,?3)
       ON CONFLICT(installation_id) DO UPDATE SET schema_json=excluded.schema_json,verified_ms=excluded.verified_ms,schema_error=NULL,rejection_code=NULL,rejected_ms=NULL,updated_ms=excluded.updated_ms`)
@@ -143,13 +142,12 @@ const connectionStatements = (db: Database, schema: Schema, previous: Schema | u
     // The write check proves one Chore log; it no longer counts once the binding points at another.
     db.prepare(`UPDATE chores_notion SET write_check_ms=NULL,write_check_state=NULL,write_check_code=NULL,write_check_cleanup=NULL,write_check_page_url=NULL,write_check_log_source=NULL
       WHERE installation_id=? AND write_check_log_source IS NOT ?`).bind(installationId, canonicalId(schema.log.dataSourceId) ?? schema.log.dataSourceId),
-    ...(peopleChanged ? resetPeopleSyncStatements(db) : []),
     audit(db, actor, "chores.connection_verified", now),
   ];
 };
 
 /**
- * POST /verify: {}. Reads the layout of every database Core has bound for Chores (at most four Notion requests), checks it
+ * POST /verify: {}. Reads the layout of both databases Core has bound for Chores (two Notion requests), checks it
  * and saves it. A failed check saves nothing and names the binding to fix.
  */
 async function verify(context: AdminRouteContext, db: Database, actor: string, now: number) {
@@ -160,7 +158,7 @@ async function verify(context: AdminRouteContext, db: Database, actor: string, n
   if (blocked && coreMessages[blocked]) return refuse(409, blocked, coreMessages[blocked]!);
   try {
     const schema = await new ChoresNotion(context.services.notion).readSchema();
-    await db.batch(connectionStatements(db, schema, parseSchema(row), actor, now));
+    await db.batch(connectionStatements(db, schema, actor, now));
   } catch (error) {
     const field = (error as { field?: string }).field;
     return notionFailureResponse(error, field ? { field } : {});
@@ -168,33 +166,19 @@ async function verify(context: AdminRouteContext, db: Database, actor: string, n
   return status(context, db);
 }
 
-/** PUT /view: { url }. The People database's "Needs a Notion account" view, or null to clear it. */
-async function saveView(context: AdminRouteContext, db: Database, now: number) {
-  const input = object(await context.json(4096));
-  if (Object.keys(input).length !== 1 || !("url" in input)) return refuse(400, "validation", "Send the view link only.");
-  const url = input.url === null || input.url === "" ? null : validNotionUrl(input.url);
-  if (url === undefined) return refuse(400, "invalid_link", "Use the view's Notion link: https and a notion.so, notion.com or notion.site address.");
-  const result = await db.prepare("UPDATE chores_notion SET needs_account_view_url=?,updated_ms=? WHERE installation_id=?").bind(url, now, installationId).run();
-  if (result.meta?.changes !== 1) return refuse(409, "not_verified", "Verify the Notion databases first.");
-  return status(context, db);
-}
-
 /**
- * POST /people-accounts: People rows with exactly one Notion account, from the first page of rows that have one, to choose
- * the Person-write check's account. One Notion request. Names go to the Admin's page only.
+ * POST /people-accounts: the Person-write check's choices, from Core's copy of the People database: rows that hold exactly
+ * one Notion account. No Notion request. Names go to the Admin's page only.
  */
-async function peopleAccounts(context: AdminRouteContext, db: Database) {
-  const [row, core] = await Promise.all([readConnection(db), readCore(context.services.notion)]);
-  const problem = connectionProblem(row, core);
-  if (problem) return refuse(409, problem, "Verify the Notion databases first.");
-  try { return json({ accounts: await readPeopleAccounts(new ChoresNotion(context.services.notion), parseSchema(row)!) }); }
-  catch (error) { return notionFailureResponse(error); }
+async function peopleAccounts(db: Database) {
+  const people = await listNotionPeopleAccounts(db as unknown as D1Database, installationId);
+  if (!people) return refuse(409, "people_not_set_up", "People matching is not set up. Choose and verify the People database in Settings > Integrations > Notion first.");
+  return json({ accounts: people.slice(0, 100).map((person) => ({ name: person.name.slice(0, 200), notionUserId: person.notionUserId, memberId: person.externalId.slice(0, 200) })) });
 }
 
 /** What the setup page shows. Core's state in words it can act on, and Chores' own checks. No token, no email. */
 export async function status(context: AdminRouteContext, db: Database) {
   const [row, core] = await Promise.all([readConnection(db), readCore(context.services.notion)]);
-  const schema = parseSchema(row);
   const verified = verifiedForBindings(row, core);
   return json({
     core: {
@@ -204,8 +188,6 @@ export async function status(context: AdminRouteContext, db: Database) {
     bindings: Object.fromEntries(bindingIds.map((id) => [id, core.bindings[id] ? { name: core.bindings[id]!.name || null, databaseId: core.bindings[id]!.databaseId } : null])),
     verifiedMs: verified ? row!.verifiedMs : null, schemaError: row?.schemaError ?? null,
     problem: connectionProblem(row, core) ?? refusalProblem(row) ?? null, rejectedMs: row?.rejectedMs ?? null,
-    taskVerified: verified && Boolean(schema?.task),
-    needsAccountViewUrl: row?.viewUrl ?? null,
     writeCheck: { state: row?.writeCheckState ?? null, checkedMs: row?.writeCheckMs ?? null, code: row?.writeCheckCode ?? null, cleanup: row?.writeCheckCleanup ?? null, pageUrl: row?.writeCheckPageUrl ?? null },
   });
 }
@@ -214,15 +196,14 @@ export async function status(context: AdminRouteContext, db: Database) {
 export async function setupRoute(context: AdminRouteContext): Promise<Response | undefined> {
   const path = context.url.pathname.slice("/module-setup/chores".length);
   const method = context.request.method;
-  const known = path === "/status" && method === "GET" || path === "/verify" && method === "POST" || path === "/view" && method === "PUT"
+  const known = path === "/status" && method === "GET" || path === "/verify" && method === "POST"
     || path === "/people-accounts" && method === "POST" || path === "/person-write-check" && method === "POST";
   if (!known) return undefined;
   const { userId } = await requireAdmin(context);
   const db = context.db as Database; const now = Date.now();
   if (path === "/status") return status(context, db);
   if (path === "/verify") return verify(context, db, userId, now);
-  if (path === "/view") return saveView(context, db, now);
-  if (path === "/people-accounts") return peopleAccounts(context, db);
+  if (path === "/people-accounts") return peopleAccounts(db);
   const input = object(await context.json(1024));
   const notionUserId = Object.keys(input).length === 1 ? canonicalId(input.notionUserId) : undefined;
   if (!notionUserId) return refuse(400, "validation", "Choose the Notion account to test with.");

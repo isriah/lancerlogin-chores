@@ -1,7 +1,7 @@
 // Module definition. It imports nothing, so the plugin's own unit tests can read it without a Core checkout.
 const tables = [
   "chores_settings", "chores_label_rules", "chores_notion", "chores_catalog", "chores_runs", "chores_crew",
-  "chores_assignments", "chores_people", "chores_sync", "chores_events",
+  "chores_assignments", "chores_sync", "chores_events",
 ] as const;
 
 const manifest = {
@@ -12,15 +12,13 @@ const manifest = {
   available: true,
   dependencies: [],
   // Notion through Core's one connection (SDK 1.8.0). Core refuses anything not declared here. The token is saved in
-  // Settings > Integrations > Notion; an Admin chooses the database for each binding on the Chores setup page. Chores is the
-  // only writer of People and never writes its "Notion account" column (enforced in src/notion.ts). No email addresses.
+  // Settings > Integrations > Notion; an Admin chooses the database for each binding on the Chores setup page. Who is which
+  // Notion account comes from Core's people matching (SDK 1.10.0), so Chores has no People database. No email addresses.
   notion: {
     users: ["retrieve"],
     bindings: [
       { id: "chores", label: "Chores database", reason: "The list of chores, how many people each needs and the days it runs. Read only.", required: true, kind: "data_source", operations: ["retrieve", "query"] },
       { id: "log", label: "Chore log database", reason: "One row per person per chore per day. Chores adds and updates rows, and removes only its own test row.", required: true, kind: "data_source", operations: ["retrieve", "query", "pages.create", "pages.retrieve", "pages.update", "pages.trash"] },
-      { id: "people", label: "People database", reason: "Links each member ID to a Notion account. Chores adds rows and keeps names and Active up to date.", required: true, kind: "data_source", operations: ["retrieve", "query", "pages.create", "pages.update"] },
-      { id: "task", label: "Task database (optional)", reason: "Read only, to suggest a Notion account for People rows that have none.", required: false, kind: "data_source", operations: ["retrieve", "query"] },
     ],
   },
   // The label says what holding it reveals: Chores reads who is checked in today, without Attendance's own capability.
@@ -37,7 +35,8 @@ const manifest = {
       { id: "person-write-check", label: "Person-write check in the Chore log", required: true },
     ],
   },
-  jobs: [{ id: "chores.run", interval: 300_000, label: "Chores" }],
+  // The chores.run job arrives with the picking engine.
+  jobs: [],
   discordCommands: [],
   apiRoutes: [
     { path: "/admin/chores", match: "prefix", access: "workspace" },
@@ -47,15 +46,15 @@ const manifest = {
   persistence: { tables: [...tables], sharedFields: [], transientAuthority: [] },
   // Only settings and label rules travel in a backup. Core's Notion token and bindings travel in Core's part of an
   // entire-installation backup. After a restore an Admin verifies the databases and runs the Person-write check again, and
-  // runs, crews, assignments, the People mirror and sync state start empty and are rebuilt from Notion.
+  // runs, crews, assignments and sync state start empty and are rebuilt from Notion.
   backup: {
     version: 1,
     tables: ["chores_settings", "chores_label_rules"],
-    nonPortableTables: ["chores_notion", "chores_catalog", "chores_runs", "chores_crew", "chores_assignments", "chores_people", "chores_sync", "chores_events"],
+    nonPortableTables: ["chores_notion", "chores_catalog", "chores_runs", "chores_crew", "chores_assignments", "chores_sync", "chores_events"],
   },
   lifecycle: {
     cleanupTargets: [
-      "chores_events", "chores_sync", "chores_people", "chores_assignments", "chores_crew", "chores_runs", "chores_catalog",
+      "chores_events", "chores_sync", "chores_assignments", "chores_crew", "chores_runs", "chores_catalog",
       "chores_notion", "chores_label_rules", "chores_settings",
       "platform_module_setup_progress:chores", "platform_module_assignments:chores",
     ],

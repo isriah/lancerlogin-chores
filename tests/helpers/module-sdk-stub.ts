@@ -10,3 +10,6 @@ export async function installationTimeZone(db: any, installationId: string): Pro
   if (!row?.timeZone) throw new Error("The installation time zone is not configured");
   return row.timeZone;
 }
+/** Core's people matching (SDK 1.10.0). A test sets `peopleAccounts.rows`; undefined is "no verified People database". */
+export const peopleAccounts: { rows: { memberId: string | null; externalId: string; name: string; notionUserId: string; matched: boolean }[] | undefined } = { rows: undefined };
+export async function listNotionPeopleAccounts(_db: any, _installationId: string) { return peopleAccounts.rows; }

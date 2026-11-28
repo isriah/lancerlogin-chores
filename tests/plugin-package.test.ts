@@ -19,20 +19,20 @@ test("package.json, the manifest and plugin-release.json agree", () => {
   assert.equal(manifest.contractVersion, pkg.lancerlogin.contract);
   assert.equal(manifest.tablePrefix, pkg.lancerlogin.tablePrefix);
   assert.equal(pkg.name, `lancerlogin-module-${manifest.id}`);
-  assert.equal(pkg.lancerlogin.core, ">=2.1.0-beta.12 <3.0.0", "the first Core with its Notion connection");
-  assert.equal(pkg.peerDependencies["@lancerlogin/module-sdk"], "^1.8.0", "services.notion and NotionBindingField");
+  // Core's people matching (SDK 1.10.0) ships in the beta after 2.1.0-beta.13. Until that beta is published this range lets
+  // the plugin compose on the development Core that already has it; raise it to that beta before Chores is released.
+  assert.equal(pkg.lancerlogin.core, ">=2.1.0-beta.13 <3.0.0");
+  assert.equal(pkg.peerDependencies["@lancerlogin/module-sdk"], "^1.10.0", "services.notion, NotionBindingField and listNotionPeopleAccounts");
   assert.equal(release.repository, "isriah/lancerlogin-chores");
   assert.match(release.core.commit, /^[0-9a-f]{40}$/);
   assert.equal(manifest.setup.version, 1, "Core cannot update an installed module's setup version, so raising it locks setup");
 });
 
-test("Notion: the four bindings with only the operations Chores calls, user lookup, and no email", () => {
+test("Notion: the two bindings with only the operations Chores calls, user lookup, no email and no People database", () => {
   assert.deepEqual(manifest.notion.users, ["retrieve"]);
   assert.deepEqual(manifest.notion.bindings.map((binding) => [binding.id, binding.required, binding.kind, [...binding.operations]]), [
     ["chores", true, "data_source", ["retrieve", "query"]],
     ["log", true, "data_source", ["retrieve", "query", "pages.create", "pages.retrieve", "pages.update", "pages.trash"]],
-    ["people", true, "data_source", ["retrieve", "query", "pages.create", "pages.update"]],
-    ["task", false, "data_source", ["retrieve", "query"]],
   ]);
   for (const binding of manifest.notion.bindings) {
     assert.ok(binding.label.length <= 80 && binding.label.trim() === binding.label);
@@ -48,10 +48,9 @@ test("Notion: the four bindings with only the operations Chores calls, user look
   }
 });
 
-test("a job, the setup steps, routes and pages are declared and each has exactly one handler", () => {
-  assert.deepEqual(manifest.jobs, [{ id: "chores.run", interval: 300_000, label: "Chores" }]);
-  assert.ok(manifest.jobs.every((job) => job.interval >= 300_000), "interval-only jobs, at least five minutes apart");
-  assert.deepEqual(Object.keys(api.jobs!), ["chores.run"]);
+test("the setup steps, routes and pages are declared and each has exactly one handler; no job until the picking engine", () => {
+  assert.deepEqual(manifest.jobs, []);
+  assert.deepEqual(Object.keys(api.jobs!), []);
   assert.deepEqual(manifest.setup.steps.map((step) => step.id), ["notion-connection", "person-write-check"]);
   assert.deepEqual(Object.keys(api.setup!.predicates).sort(), ["notion-connection", "person-write-check"]);
   assert.deepEqual(manifest.apiRoutes.map((route) => route.path), Object.keys(api.routes!));
@@ -62,7 +61,9 @@ test("a job, the setup steps, routes and pages are declared and each has exactly
 
 test("every table is prefixed, declared, classified for backup and cleaned up in the declared order", () => {
   const sql = readdirSync(new URL("migrations/", root)).filter((name) => name.endsWith(".sql")).map((name) => read(`migrations/${name}`)).join("\n");
-  const created = [...sql.matchAll(/CREATE TABLE (\w+)/g)].map((match) => match[1]!);
+  const dropped = new Set([...sql.matchAll(/DROP TABLE (\w+)/g)].map((match) => match[1]!));
+  const created = [...sql.matchAll(/CREATE TABLE (\w+)/g)].map((match) => match[1]!).filter((table) => !dropped.has(table));
+  assert.deepEqual([...dropped], ["chores_people"], "People matching moved to Core");
   assert.deepEqual([...created].sort(), [...manifest.persistence.tables].sort());
   for (const table of created) {
     assert.ok(table.startsWith(manifest.tablePrefix), table);
